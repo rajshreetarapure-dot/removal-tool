@@ -392,48 +392,120 @@ if load_btn:
 # Main UI (after loaded)
 # -----------------------------
 if st.session_state.loaded:
+    if st.session_state.loaded:
+
     universe = st.session_state.universe
     carrier_to_plan_names = universe["carrier_to_plan_names"]
     classification_to_carriers = universe["classification_to_carriers"]
     carrier_to_classifications = universe["carrier_to_classifications"]
 
-    # Show deprecated summary
-    miss = st.session_state.missing_plan_ids_count
-    dep_found = st.session_state.deprecated_found
-    if dep_file is not None:
-        st.warning(
-            f"Plans in input but **not** found in DB: **{miss}**. "
-            f"Deprecated plans matched: **{dep_found}**."
+    st.divider()
+
+    # =============================
+    # TOP FILTER ROW
+    # =============================
+    col1, col2, col3 = st.columns([1, 1, 2])
+
+    with col1:
+        class_filter = st.selectbox(
+            "Plan Classification Filter",
+            options=["(none)"] + st.session_state.all_classifications,
         )
-    else:
-        st.caption(f"Plans in input but not found in DB: {miss} (upload Deprecated file to match these).")
+
+    with col2:
+        show_all = st.button("Show All Carriers")
+
+    with col3:
+        carrier_search = st.text_input("Search Carrier / Plan Name")
 
     st.divider()
 
-    # --- Top controls: Global classification filter + Show all ---
-    c1, c2, c3 = st.columns([1, 1, 2])
+    # =============================
+    # MAIN 2-COLUMN LAYOUT
+    # =============================
+    left, right = st.columns([1, 2])
 
-    with c1:
-        class_filter = st.selectbox(
-            "Global Plan Classification Filter (optional)",
-            options=["(none)"] + st.session_state.all_classifications,
-            index=0,
-            help="Pick a classification (e.g., State) to show only carriers that have that classification. "
-                 "When you select a carrier while this filter is active, that carrier will remove ONLY this classification.",
+    # -------- LEFT PANEL --------
+    with left:
+        st.subheader("Plan Name Removal (Optional)")
+        enable_plan_name_filter = st.checkbox("Enable Plan Name Filter")
+
+        selected_plan_names = set()
+        plan_name_keywords = []
+
+        if enable_plan_name_filter:
+            plan_names_pool = set()
+            for c in st.session_state.selected_carriers:
+                plan_names_pool |= carrier_to_plan_names.get(c, set())
+
+            plan_names_pool = sorted(list(plan_names_pool))
+
+            select_all_names = st.checkbox("Select All Plan Names")
+            if select_all_names:
+                selected_plan_names = set(plan_names_pool)
+            else:
+                selected_plan_names = set(
+                    st.multiselect("Plan Names", options=plan_names_pool)
+                )
+
+            kw_text = st.text_area("Plan Name Keywords")
+            plan_name_keywords = parse_keywords(kw_text)
+
+    # -------- RIGHT PANEL --------
+    with right:
+        st.subheader("Carrier Selection")
+
+        select_all_carriers = st.checkbox("Select All Carriers")
+        if select_all_carriers:
+            st.session_state.selected_carriers = set(st.session_state.displayed_carriers)
+
+        selected_carriers_list = st.multiselect(
+            "Carriers",
+            options=st.session_state.displayed_carriers,
+            default=list(st.session_state.selected_carriers),
         )
 
-    with c2:
-        if st.button("Show All Carriers"):
-            st.session_state.active_global_class_filter = None
-            st.session_state.displayed_carriers = list(st.session_state.all_carriers)
+        st.session_state.selected_carriers = set(selected_carriers_list)
 
-    with c3:
-        carrier_search = st.text_input(
-            "Search carriers (matches Carrier Name OR Plan Name)",
-            value="",
-            help="Type e.g. 'blue' or a plan keyword like 'rae2'.",
+        st.subheader("Global Plan Type Filter")
+        selected_types = set(
+            st.multiselect("Plan Types", options=st.session_state.all_types)
         )
 
+        st.subheader("Selections Summary")
+        for c in sorted(st.session_state.selected_carriers):
+            cls = st.session_state.carrier_classification_map.get(c)
+            txt = cls if cls else "ALL"
+            st.write(f"**{c} → {txt}**")
+
+    st.divider()
+
+    # =============================
+    # FINAL BUTTON (VISIBLE)
+    # =============================
+    if st.button("FINAL: Generate Removal Output", type="primary"):
+        with st.spinner("Computing removals..."):
+            tabs = compute_removals(
+                st.session_state.input_df,
+                st.session_state.plan_lookup,
+                st.session_state.selected_carriers,
+                st.session_state.carrier_classification_map,
+                selected_types,
+                enable_plan_name_filter,
+                selected_plan_names,
+                plan_name_keywords,
+            )
+
+        if tabs:
+            xbytes = make_excel_bytes(tabs)
+            st.download_button(
+                "Download Removal Output",
+                data=xbytes,
+                file_name="removal_output.xlsx",
+            )
+        else:
+            st.warning("No removals found.")
+            
     # Apply global classification filter
     if class_filter != "(none)":
         st.session_state.active_global_class_filter = class_filter
@@ -630,3 +702,4 @@ if st.session_state.loaded:
                     file_name="removal_output.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
