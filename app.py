@@ -392,7 +392,6 @@ if load_btn:
 # Main UI (after loaded)
 # -----------------------------
 if st.session_state.loaded:
-    if st.session_state.loaded:
 
     universe = st.session_state.universe
     carrier_to_plan_names = universe["carrier_to_plan_names"]
@@ -702,4 +701,5 @@ if st.session_state.loaded:
                     file_name="removal_output.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
 
