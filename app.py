@@ -545,14 +545,6 @@ for c in newly_selected:
         st.session_state.carrier_classification_map.setdefault(c, None)
 
     st.session_state.carrier_types_map.setdefault(c, set())
-        for c in newly_selected:
-            if active_cls is not None:
-                st.session_state.carrier_classification_map[c] = active_cls
-            else:
-                st.session_state.carrier_classification_map.setdefault(c, None)
-
-            st.session_state.carrier_types_map.setdefault(c, set())
-
         # Optional: plan-name explicit picking only when enabled
         if enable_plan_name_filter and st.session_state.selected_carriers:
             with st.expander("Optional: pick specific Plan Names (instead of keywords)", expanded=False):
@@ -689,4 +681,5 @@ for c in newly_selected:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
 
