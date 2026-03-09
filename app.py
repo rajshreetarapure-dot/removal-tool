@@ -423,7 +423,7 @@ if "bulk_default_types" not in st.session_state:
 # -----------------------------
 # UI: Header + Notes
 # -----------------------------
-st.title("Carrier Removal Tool (Streamlit)")
+st.title("Removal Tool")
 
 st.info(
     "📌 **DB file requirements (upload .xlsx or .csv):**\n"
@@ -913,3 +913,4 @@ if st.session_state.loaded:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
