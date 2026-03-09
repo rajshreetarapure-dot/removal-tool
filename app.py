@@ -479,6 +479,38 @@ if st.session_state.loaded:
     with left:
         st.markdown("### Carriers")
 
+        shown_carriers = (
+    displayed_carriers
+    if "displayed_carriers" in locals()
+    else st.session_state.get("all_carriers", [])
+)
+
+if not shown_carriers:
+    st.info("Load & Analyze to view carriers.")
+else:
+    if "carrier_widget_value" not in st.session_state:
+        st.session_state.carrier_widget_value = []
+
+    if not st.session_state.carrier_widget_value:
+        st.session_state.carrier_widget_value = sorted(
+            list(st.session_state.selected_carriers.intersection(set(shown_carriers))),
+            key=lambda x: x.lower(),
+        )
+
+    selected_now = st.multiselect(
+        "Select carriers",
+        options=shown_carriers,
+        key="carrier_widget_value",
+        label_visibility="collapsed",
+    )
+
+    prev = set(st.session_state.selected_carriers)
+    shown = set(shown_carriers)
+    picked = set(selected_now)
+
+    keep_hidden = prev - shown
+    st.session_state.selected_carriers = keep_hidden | picked
+
         colA, colB, colC = st.columns([1, 1, 2])
         with colA:
             select_all_shown = st.button("Select all shown")
@@ -697,6 +729,7 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
 
 
 
