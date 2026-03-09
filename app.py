@@ -16,7 +16,7 @@ DEPRECATED_ACCEPTABLE_PLAN_ID_COLS = ["Plan_ID", "PlanId", "plan_id", "planid"]
 
 
 # -----------------------------
-# Helpers
+# Helpers (UNCHANGED)
 # -----------------------------
 def split_csv_ids(cell_value: str):
     if cell_value is None:
@@ -271,15 +271,23 @@ if "selected_carriers" not in st.session_state:
 if "carrier_classification_map" not in st.session_state:
     st.session_state.carrier_classification_map = {}
 
-# UI-only addition (keeps compute_removals unchanged): per-carrier plan types
+# NEW (UI-only): per-carrier plan types (empty set = ALL)
 if "carrier_types_map" not in st.session_state:
-    st.session_state.carrier_types_map = {}  # carrier -> set(types) ; empty set means "ALL"
+    st.session_state.carrier_types_map = {}
+
+# NEW (UI-only): stable widget value for carrier multiselect
+if "carrier_widget_value" not in st.session_state:
+    st.session_state.carrier_widget_value = []
+
+# NEW (UI-only): plan name selection that persists + plan name search
+if "selected_plan_names_state" not in st.session_state:
+    st.session_state.selected_plan_names_state = set()
+
+if "plan_name_search" not in st.session_state:
+    st.session_state.plan_name_search = ""
 
 if "active_global_class_filter" not in st.session_state:
     st.session_state.active_global_class_filter = None
-
-if "displayed_carriers" not in st.session_state:
-    st.session_state.displayed_carriers = []
 
 if "loaded" not in st.session_state:
     st.session_state.loaded = False
@@ -375,13 +383,15 @@ if load_btn:
             st.session_state.deprecated_found = deprecated_found
             st.session_state.deprecated_total = deprecated_total
 
-            st.session_state.displayed_carriers = list(all_carriers)
             st.session_state.active_global_class_filter = None
 
             # reset selections
             st.session_state.selected_carriers = set()
             st.session_state.carrier_classification_map = {}
             st.session_state.carrier_types_map = {}
+            st.session_state.carrier_widget_value = []
+            st.session_state.selected_plan_names_state = set()
+            st.session_state.plan_name_search = ""
 
             st.session_state.loaded = True
 
@@ -404,13 +414,13 @@ if st.session_state.loaded:
     carrier_to_types = universe["carrier_to_types"]
 
     # ---------------------------
-    # SIDEBAR: Filters & Upload notes
+    # SIDEBAR: Filters
     # ---------------------------
     with st.sidebar:
         st.header("Controls")
 
         st.caption("Global classification filter (optional)")
-        # UI CHANGE: keep sentinel "(none)" for logic, but do not SHOW "none" to the user.
+        # UI CHANGE: do not display "(none)"
         class_filter = st.selectbox(
             "Plan Classification",
             options=["(none)"] + st.session_state.all_classifications,
@@ -425,9 +435,8 @@ if st.session_state.loaded:
 
         st.caption("Plan Name filter (optional)")
         enable_plan_name_filter = st.checkbox("Enable Plan Name filtering", value=False)
-        plan_name_keywords = []
-        selected_plan_names = set()
 
+        plan_name_keywords = []
         if enable_plan_name_filter:
             kw_text = st.text_area("Keywords (comma/newline)", value="", height=90)
             plan_name_keywords = parse_keywords(kw_text)
@@ -444,11 +453,8 @@ if st.session_state.loaded:
             st.info(f"Missing in DB: {miss} (upload deprecated file to match)")
 
     # ---------------------------
-    # MAIN: 2-column dashboard
+    # MAIN: compute displayed_carriers FIRST (prevents NameError / AttributeError)
     # ---------------------------
-    st.subheader("Dashboard")
-
-    # Apply global class filter to determine the carrier pool
     if class_filter != "(none)":
         st.session_state.active_global_class_filter = class_filter
         carriers_base = sorted(list(classification_to_carriers.get(class_filter, set())), key=lambda x: x.lower())
@@ -456,7 +462,6 @@ if st.session_state.loaded:
         st.session_state.active_global_class_filter = None
         carriers_base = list(st.session_state.all_carriers)
 
-    # Apply search (carrier OR any plan name under carrier)
     if carrier_search.strip():
         q = carrier_search.strip().lower()
         filtered = []
@@ -471,45 +476,14 @@ if st.session_state.loaded:
     else:
         displayed_carriers = carriers_base
 
+    st.subheader("Dashboard")
     left, right = st.columns([2, 1], gap="large")
 
     # ---------------------------
-    # LEFT: Carrier selection
+    # LEFT: Carrier selection + Plan-name search/pick (searchable + multi-select)
     # ---------------------------
     with left:
         st.markdown("### Carriers")
-
-    shown_carriers = (
-        displayed_carriers
-        if "displayed_carriers" in locals()
-        else st.session_state.get("all_carriers", [])
-)
-
-    if not shown_carriers:
-        st.info("Load & Analyze to view carriers.")
-    else:
-        if "carrier_widget_value" not in st.session_state:
-            st.session_state.carrier_widget_value = []
-
-        if not st.session_state.carrier_widget_value:
-            st.session_state.carrier_widget_value = sorted(
-                list(st.session_state.selected_carriers.intersection(set(shown_carriers))),
-                key=lambda x: x.lower(),
-        )
-
-        selected_now = st.multiselect(
-            "Select carriers",
-            options=shown_carriers,
-            key="carrier_widget_value",
-            label_visibility="collapsed",
-    )
-
-        prev = set(st.session_state.selected_carriers)
-        shown = set(shown_carriers)
-        picked = set(selected_now)
-
-        keep_hidden = prev - shown
-        st.session_state.selected_carriers = keep_hidden | picked
 
         colA, colB, colC = st.columns([1, 1, 2])
         with colA:
@@ -523,93 +497,93 @@ if st.session_state.loaded:
             st.session_state.selected_carriers = set()
             st.session_state.carrier_classification_map = {}
             st.session_state.carrier_types_map = {}
+            st.session_state.carrier_widget_value = []
+            st.session_state.selected_plan_names_state = set()
 
         if select_all_shown:
             newly = set(displayed_carriers) - set(st.session_state.selected_carriers)
             st.session_state.selected_carriers |= set(displayed_carriers)
 
-            # auto-apply global classification to newly selected carriers
             active_cls = st.session_state.active_global_class_filter
-            for c in newly:
+            for carrier in newly:
                 if active_cls is not None:
-                    st.session_state.carrier_classification_map[c] = active_cls
+                    st.session_state.carrier_classification_map[carrier] = active_cls
                 else:
-                    st.session_state.carrier_classification_map.setdefault(c, None)
+                    st.session_state.carrier_classification_map.setdefault(carrier, None)
+                st.session_state.carrier_types_map.setdefault(carrier, set())
 
-                # default plan types = ALL (empty set means ALL)
-                st.session_state.carrier_types_map.setdefault(c, set())
+            # sync widget value to include all displayed carriers selected
+            shown = set(displayed_carriers)
+            keep_hidden = set(st.session_state.carrier_widget_value) - shown
+            st.session_state.carrier_widget_value = sorted(list(keep_hidden | shown), key=lambda x: x.lower())
 
-# ---- Stable carrier multiselect ----
-shown_carriers = displayed_carriers if "displayed_carriers" in locals() else st.session_state.all_carriers
+        # Ensure widget state is always a subset of displayed_carriers + (hidden selections handled separately)
+        shown_set = set(displayed_carriers)
+        prev_selected = set(st.session_state.selected_carriers)
 
-if "carrier_widget_value" not in st.session_state:
-    st.session_state.carrier_widget_value = []
+        # If widget empty but we do have previous selections, initialize from previous (shown only)
+        if not st.session_state.carrier_widget_value and prev_selected:
+            st.session_state.carrier_widget_value = sorted(list(prev_selected.intersection(shown_set)), key=lambda x: x.lower())
 
-# Initialize widget value from stored selection (first run only)
-if not st.session_state.carrier_widget_value:
-    st.session_state.carrier_widget_value = sorted(
-        list(st.session_state.selected_carriers.intersection(set(shown_carriers))),
-        key=lambda x: x.lower(),
-    )
+        selected_now = st.multiselect(
+            "Select carriers",
+            options=displayed_carriers,
+            key="carrier_widget_value",
+            label_visibility="collapsed",
+        )
 
-selected_now = st.multiselect(
-    "Select carriers",
-    options=shown_carriers,
-    key="carrier_widget_value",
-    label_visibility="collapsed",
-)
+        # Merge hidden selections so search doesn’t wipe them
+        prev = set(st.session_state.selected_carriers)
+        picked = set(selected_now)
+        keep_hidden = prev - shown_set
+        st.session_state.selected_carriers = keep_hidden | picked
 
-# Merge hidden selections (important when searching)
-prev = set(st.session_state.selected_carriers)
-shown = set(shown_carriers)
-picked = set(selected_now)
+        # Apply defaults for newly selected
+        newly_selected = st.session_state.selected_carriers - prev
+        active_cls = st.session_state.active_global_class_filter
+        for carrier in newly_selected:
+            if active_cls is not None:
+                st.session_state.carrier_classification_map[carrier] = active_cls
+            else:
+                st.session_state.carrier_classification_map.setdefault(carrier, None)
+            st.session_state.carrier_types_map.setdefault(carrier, set())
 
-keep_hidden = prev - shown
-st.session_state.selected_carriers = keep_hidden | picked
-
-# Apply classification & plan-type defaults for newly selected
-newly_selected = st.session_state.selected_carriers - prev
-active_cls = st.session_state.active_global_class_filter
-
-for carrier in newly_selected:
-    if active_cls is not None:
-        st.session_state.carrier_classification_map[carrier] = active_cls
-    else:
-        st.session_state.carrier_classification_map.setdefault(carrier, None)
-
-    st.session_state.carrier_types_map.setdefault(carrier, set())
-
-# Optional: plan-name explicit picking only when enabled  ✅ OUTSIDE the loop
-if enable_plan_name_filter and st.session_state.selected_carriers:
-    with st.expander("Optional: pick specific Plan Names (instead of keywords)", expanded=False):
-        plan_names_pool = set()
-        for carrier in st.session_state.selected_carriers:
-            plan_names_pool |= carrier_to_plan_names.get(carrier, set())
-        plan_names_pool = sorted(list(plan_names_pool), key=lambda x: x.lower())
-
-        pick_all_names = st.checkbox("Select all plan names shown", value=False)
-        if pick_all_names:
-            selected_plan_names = set(plan_names_pool)
-            st.write(f"Selected {len(selected_plan_names)} plan names.")
-        else:
-            selected_plan_names = set(st.multiselect("Plan Names", options=plan_names_pool, default=[]))
-        # Optional: plan-name explicit picking only when enabled
+        # -------- Plan Names: search + multi-select (under selected carriers) --------
         if enable_plan_name_filter and st.session_state.selected_carriers:
-            with st.expander("Optional: pick specific Plan Names (instead of keywords)", expanded=False):
-                plan_names_pool = set()
-                for c in st.session_state.selected_carriers:
-                    plan_names_pool |= carrier_to_plan_names.get(c, set())
-                plan_names_pool = sorted(list(plan_names_pool), key=lambda x: x.lower())
+            st.markdown("### Plan Names (under selected carriers)")
 
-                pick_all_names = st.checkbox("Select all plan names shown", value=False)
-                if pick_all_names:
-                    selected_plan_names = set(plan_names_pool)
-                    st.write(f"Selected {len(selected_plan_names)} plan names.")
-                else:
-                    selected_plan_names = set(st.multiselect("Plan Names", options=plan_names_pool, default=[]))
+            st.session_state.plan_name_search = st.text_input(
+                "Search plan names",
+                value=st.session_state.plan_name_search,
+                placeholder="Type to filter plan names (e.g., rae2, rae3)",
+                key="plan_name_search_box",
+            )
+
+            plan_names_pool = set()
+            for carrier in st.session_state.selected_carriers:
+                plan_names_pool |= carrier_to_plan_names.get(carrier, set())
+            plan_names_pool = sorted(list(plan_names_pool), key=lambda x: x.lower())
+
+            qn = st.session_state.plan_name_search.strip().lower()
+            if qn:
+                plan_names_pool = [pn for pn in plan_names_pool if qn in (pn or "").lower()]
+
+            prev_names = set(st.session_state.selected_plan_names_state)
+            shown_names_set = set(plan_names_pool)
+            keep_hidden_names = prev_names - shown_names_set
+
+            picked_names = st.multiselect(
+                "Pick plan names (multi-select)",
+                options=plan_names_pool,
+                default=sorted(list(prev_names.intersection(shown_names_set)), key=lambda x: x.lower()),
+                key="plan_names_pick",
+            )
+
+            st.session_state.selected_plan_names_state = keep_hidden_names | set(picked_names)
+            st.caption(f"Plan names selected: {len(st.session_state.selected_plan_names_state)}")
 
     # ---------------------------
-    # RIGHT: Summary + per-carrier plan types + final action
+    # RIGHT: Per-carrier Classification + Plan Types (dropdown + multi-select), Final action
     # ---------------------------
     with right:
         st.markdown("### Summary")
@@ -619,14 +593,13 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
         if not selected_carriers_sorted:
             st.info("Select carriers to enable output.")
         else:
-            # UI CHANGE: editable per-carrier Classification + Plan Types (multi-select)
             rows = []
-            for c in selected_carriers_sorted:
-                cls_val = st.session_state.carrier_classification_map.get(c, None)
-                types_val = st.session_state.carrier_types_map.get(c, set()) or set()
+            for carrier in selected_carriers_sorted:
+                cls_val = st.session_state.carrier_classification_map.get(carrier, None)
+                types_val = st.session_state.carrier_types_map.get(carrier, set()) or set()
                 rows.append(
                     {
-                        "Carrier": c,
+                        "Carrier": carrier,
                         "Plan Classification": cls_val if cls_val is not None else "ALL",
                         "Plan Types": sorted(list(types_val), key=lambda x: x.lower()),
                     }
@@ -659,25 +632,23 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
                 },
             )
 
-            # Apply edits back (no logic changes inside compute_removals)
+            # Apply edits back
             for _, r in edited.iterrows():
-                c = str(r["Carrier"]).strip()
+                carrier = str(r["Carrier"]).strip()
 
-                # classification
                 v = str(r["Plan Classification"]).strip()
                 if v.upper() == "ALL" or v == "":
-                    st.session_state.carrier_classification_map[c] = None
+                    st.session_state.carrier_classification_map[carrier] = None
                 else:
-                    allowed_cls = carrier_to_classifications.get(c, set())
+                    allowed_cls = carrier_to_classifications.get(carrier, set())
                     if v in allowed_cls:
-                        st.session_state.carrier_classification_map[c] = v
+                        st.session_state.carrier_classification_map[carrier] = v
 
-                # types
                 tv = r.get("Plan Types", [])
                 tv = tv if isinstance(tv, list) else []
-                allowed_types = carrier_to_types.get(c, set())
+                allowed_types = carrier_to_types.get(carrier, set())
                 cleaned = [t for t in tv if t in allowed_types]
-                st.session_state.carrier_types_map[c] = set(cleaned)
+                st.session_state.carrier_types_map[carrier] = set(cleaned)
 
             st.divider()
 
@@ -685,31 +656,28 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
 
             if generate:
                 with st.spinner("Computing removals..."):
-                    # UI CHANGE: run compute_removals per-carrier with that carrier's types,
-                    # then merge tabs. compute_removals is unchanged.
                     merged_tabs: dict[str, pd.DataFrame] = {}
 
-                    for c in selected_carriers_sorted:
-                        per_carrier_types = st.session_state.carrier_types_map.get(c, set())
+                    for carrier in selected_carriers_sorted:
+                        per_carrier_types = st.session_state.carrier_types_map.get(carrier, set())
+
                         tabs = compute_removals(
                             input_df=st.session_state.input_df,
                             plan_lookup=st.session_state.plan_lookup,
-                            selected_carriers={c},
+                            selected_carriers={carrier},
                             carrier_classification_map=dict(st.session_state.carrier_classification_map),
                             selected_types_global=set(per_carrier_types),  # empty set => ALL
                             enable_plan_name_filter=enable_plan_name_filter,
-                            selected_plan_names=set(selected_plan_names),
+                            selected_plan_names=set(st.session_state.selected_plan_names_state),
                             plan_name_keywords=list(plan_name_keywords),
                         )
 
-                        # merge by sheet
                         for sheet, df in tabs.items():
                             if sheet not in merged_tabs:
                                 merged_tabs[sheet] = df.copy()
                             else:
                                 merged_tabs[sheet] = pd.concat([merged_tabs[sheet], df], ignore_index=True)
 
-                    # de-dupe
                     for sheet, df in list(merged_tabs.items()):
                         merged_tabs[sheet] = (
                             df.drop_duplicates(subset=["ProviderId", "LocationId", "PlanId"])
@@ -729,10 +697,3 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
-
-
-
-
-
-
-
