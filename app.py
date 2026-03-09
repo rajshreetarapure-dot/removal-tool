@@ -507,26 +507,44 @@ if st.session_state.loaded:
                 # default plan types = ALL (empty set means ALL)
                 st.session_state.carrier_types_map.setdefault(c, set())
 
-        selected_now = st.multiselect(
-            "Select carriers",
-            options=displayed_carriers,
-            default=sorted(
-                list(st.session_state.selected_carriers.intersection(set(displayed_carriers))),
-                key=lambda x: x.lower(),
-            ),
-            label_visibility="collapsed",
-        )
+       # ---- Stable carrier multiselect ----
 
-        prev = set(st.session_state.selected_carriers)
-        selected_now_set = set(selected_now)
+if "carrier_widget_value" not in st.session_state:
+    st.session_state.carrier_widget_value = []
 
-        # Keep previously selected carriers that aren't currently displayed
-        keep_hidden = prev - set(displayed_carriers)
-        st.session_state.selected_carriers = keep_hidden | selected_now_set
+# Initialize widget value from stored selection (first run only)
+if not st.session_state.carrier_widget_value:
+    st.session_state.carrier_widget_value = sorted(
+        list(st.session_state.selected_carriers.intersection(set(displayed_carriers))),
+        key=lambda x: x.lower(),
+    )
 
-        # Apply global classification to newly selected carriers
-        newly_selected = st.session_state.selected_carriers - prev
-        active_cls = st.session_state.active_global_class_filter
+selected_now = st.multiselect(
+    "Select carriers",
+    options=displayed_carriers,
+    key="carrier_widget_value",
+    label_visibility="collapsed",
+)
+
+# Merge hidden selections (important when searching)
+prev = set(st.session_state.selected_carriers)
+shown = set(displayed_carriers)
+picked = set(selected_now)
+
+keep_hidden = prev - shown
+st.session_state.selected_carriers = keep_hidden | picked
+
+# Apply classification & plan-type defaults for newly selected
+newly_selected = st.session_state.selected_carriers - prev
+active_cls = st.session_state.active_global_class_filter
+
+for c in newly_selected:
+    if active_cls is not None:
+        st.session_state.carrier_classification_map[c] = active_cls
+    else:
+        st.session_state.carrier_classification_map.setdefault(c, None)
+
+    st.session_state.carrier_types_map.setdefault(c, set())
         for c in newly_selected:
             if active_cls is not None:
                 st.session_state.carrier_classification_map[c] = active_cls
@@ -671,3 +689,4 @@ if st.session_state.loaded:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
