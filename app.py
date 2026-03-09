@@ -508,7 +508,7 @@ if st.session_state.loaded:
         shown = set(shown_carriers)
         picked = set(selected_now)
 
-         keep_hidden = prev - shown
+        keep_hidden = prev - shown
         st.session_state.selected_carriers = keep_hidden | picked
 
         colA, colB, colC = st.columns([1, 1, 2])
@@ -729,6 +729,7 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
 
 
 
