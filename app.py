@@ -15,7 +15,7 @@ DEPRECATED_ACCEPTABLE_PLAN_ID_COLS = ["Plan_ID", "PlanId", "plan_id", "planid"]
 
 
 # -----------------------------
-# Helpers (UNCHANGED)
+# Helpers (original logic kept)
 # -----------------------------
 def split_csv_ids(cell_value: str):
     if cell_value is None:
@@ -121,6 +121,9 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
     }
 
 
+# -----------------------------
+# ORIGINAL removal logic (kept unchanged)
+# -----------------------------
 def compute_removals(
     input_df: pd.DataFrame,
     plan_lookup: dict,
@@ -229,6 +232,162 @@ def read_deprecated_plan_ids(dep_df: pd.DataFrame) -> set[str]:
 
 
 # -----------------------------
+# Performance helpers (NEW)
+# -----------------------------
+def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Explode input PlanIds into a long table once:
+      MappingLevel, ProviderId, LocationId, PlanId
+    """
+    base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
+    base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
+    base = base.explode("PlanId").drop(columns=["PlanIds"])
+    base["PlanId"] = base["PlanId"].astype(str).map(normalize_str)
+    base = base[base["PlanId"] != ""].reset_index(drop=True)
+    return base
+
+
+def compute_removals_fast(
+    input_long: pd.DataFrame,
+    db_small: pd.DataFrame,
+    selected_carriers: set[str],
+    carrier_classification_map: dict[str, str | None],   # carrier -> cls or None (ALL)
+    carrier_types_map: dict[str, set[str] | None],       # carrier -> set(types); empty=set() => ALL; None => NO MATCH (skip)
+    carrier_plan_names_map: dict[str, set[str]],         # carrier -> set(names); empty=set() => ALL
+    enable_plan_name_filter: bool,
+    plan_name_keywords: list[str],
+) -> dict[str, pd.DataFrame]:
+    """
+    Fast/vectorized equivalent to applying the SAME selection semantics,
+    but without calling compute_removals() per carrier.
+    """
+    if not selected_carriers:
+        return {}
+
+    # Merge once (input plans -> DB details)
+    df = input_long.merge(
+        db_small,
+        left_on="PlanId",
+        right_on="Plan_ID",
+        how="left",
+        copy=False,
+    )
+
+    # Skip plan ids missing in DB (same behavior as plan_lookup missing)
+    df = df[df["Plan_ID"].notna()].copy()
+    if df.empty:
+        return {}
+
+    # Normalize for consistent comparisons
+    df["Carrier_Name"] = df["Carrier_Name"].astype(str).map(normalize_str)
+    df["Plan_Type"] = df["Plan_Type"].astype(str).map(normalize_str)
+    df["Plan Classification"] = df["Plan Classification"].astype(str).map(normalize_str)
+    df["Plan_Name"] = df["Plan_Name"].astype(str).map(normalize_str)
+
+    df.loc[df["Plan_Type"] == "", "Plan_Type"] = "(blank)"
+    df.loc[df["Plan Classification"] == "", "Plan Classification"] = "(blank)"
+    df.loc[df["Plan_Name"] == "", "Plan_Name"] = "(blank)"
+
+    # Carrier filter
+    df = df[df["Carrier_Name"].isin(selected_carriers)].copy()
+    if df.empty:
+        return {}
+
+    # Classification filter per carrier
+    req_cls = df["Carrier_Name"].map(carrier_classification_map)  # None => ALL
+    df = df[req_cls.isna() | (df["Plan Classification"] == req_cls)].copy()
+    if df.empty:
+        return {}
+
+    # Types: skip carriers with NO MATCH
+    skip_carriers = {c for c, v in carrier_types_map.items() if v is None}
+    if skip_carriers:
+        df = df[~df["Carrier_Name"].isin(skip_carriers)].copy()
+        if df.empty:
+            return {}
+
+    # Restricted types by carrier
+    restricted_types = {c: v for c, v in carrier_types_map.items() if isinstance(v, set) and len(v) > 0}
+    restricted_carriers = set(restricted_types.keys())
+
+    if restricted_carriers:
+        df_all = df[~df["Carrier_Name"].isin(restricted_carriers)].copy()
+        df_restr = df[df["Carrier_Name"].isin(restricted_carriers)].copy()
+
+        allow_rows = []
+        for c, typeset in restricted_types.items():
+            for t in typeset:
+                allow_rows.append((c, t))
+        allow_df = pd.DataFrame(allow_rows, columns=["Carrier_Name", "Plan_Type"])
+
+        df_restr = df_restr.merge(allow_df, on=["Carrier_Name", "Plan_Type"], how="inner", copy=False)
+        df = pd.concat([df_all, df_restr], ignore_index=True)
+        if df.empty:
+            return {}
+
+    # Plan-name filter logic (OR between explicit names and keywords)
+    do_name_filter = False
+    if enable_plan_name_filter:
+        any_explicit_names = any(isinstance(v, set) and len(v) > 0 for v in carrier_plan_names_map.values())
+        any_keywords = len(plan_name_keywords) > 0
+        do_name_filter = any_explicit_names or any_keywords
+
+    if do_name_filter:
+        # Keyword mask
+        if plan_name_keywords:
+            kws = [k for k in plan_name_keywords if k]
+            if kws:
+                pat = "|".join(re.escape(k) for k in kws)
+                kw_mask = df["Plan_Name"].str.contains(pat, case=False, na=False, regex=True)
+            else:
+                kw_mask = pd.Series(False, index=df.index)
+        else:
+            kw_mask = pd.Series(False, index=df.index)
+
+        # Explicit names mask
+        restricted_names = {c: v for c, v in carrier_plan_names_map.items() if isinstance(v, set) and len(v) > 0}
+        restricted_name_carriers = set(restricted_names.keys())
+
+        name_mask = pd.Series(False, index=df.index)
+        if restricted_name_carriers:
+            allow_rows = []
+            for c, nameset in restricted_names.items():
+                for n in nameset:
+                    allow_rows.append((c, n))
+            allow_df = pd.DataFrame(allow_rows, columns=["Carrier_Name", "Plan_Name"])
+
+            tmp = df[["Carrier_Name", "Plan_Name"]].copy()
+            tmp["_idx"] = tmp.index
+            matched = tmp.merge(allow_df, on=["Carrier_Name", "Plan_Name"], how="inner")
+            if not matched.empty:
+                name_mask.loc[matched["_idx"].values] = True
+
+        if plan_name_keywords:
+            keep = kw_mask | name_mask
+        else:
+            carriers_with_all_names = {
+                c for c, v in carrier_plan_names_map.items() if isinstance(v, set) and len(v) == 0
+            }
+            all_names_mask = df["Carrier_Name"].isin(carriers_with_all_names) | ~df["Carrier_Name"].isin(restricted_name_carriers)
+            keep = all_names_mask | name_mask
+
+        df = df[keep].copy()
+        if df.empty:
+            return {}
+
+    # Output tabs
+    out_df = df[["MappingLevel", "ProviderId", "LocationId", "PlanId"]].drop_duplicates(
+        subset=["MappingLevel", "ProviderId", "LocationId", "PlanId"]
+    )
+
+    tabs = {}
+    for lvl, g in out_df.groupby("MappingLevel", sort=False):
+        tabs[str(lvl)] = g[["ProviderId", "LocationId", "PlanId"]].reset_index(drop=True)
+
+    return tabs
+
+
+# -----------------------------
 # Session state init
 # -----------------------------
 if "selected_carriers" not in st.session_state:
@@ -237,11 +396,11 @@ if "selected_carriers" not in st.session_state:
 if "carrier_classification_map" not in st.session_state:
     st.session_state.carrier_classification_map = {}
 
-# carrier -> set(types) ; empty set = ALL ; None = NO MATCH (skip carrier)
+# carrier -> set(types); empty=set() => ALL; None => NO MATCH (skip)
 if "carrier_types_map" not in st.session_state:
     st.session_state.carrier_types_map = {}
 
-# carrier -> set(names) ; empty set = ALL
+# carrier -> set(names); empty=set() => ALL
 if "carrier_plan_names_map" not in st.session_state:
     st.session_state.carrier_plan_names_map = {}
 
@@ -332,7 +491,13 @@ if load_btn:
                 deprecated_total = len(dep_ids)
                 deprecated_found = len(missing_plan_ids.intersection(dep_ids))
 
-            prog.progress(90, text="Preparing UI data...")
+            prog.progress(88, text="Preparing performance caches...")
+            st.session_state.input_long = build_input_long(input_df)
+            st.session_state.db_small = db_df[
+                ["Plan_ID", "Carrier_Name", "Plan_Type", "Plan Classification", "Plan_Name"]
+            ].copy()
+
+            prog.progress(94, text="Preparing UI data...")
             all_carriers = sorted(universe["carrier_to_classifications"].keys(), key=lambda x: x.lower())
             all_classifications = sorted(universe["classification_to_carriers"].keys(), key=lambda x: x.lower())
             all_types = sorted(universe["plan_types_universe"], key=lambda x: x.lower())
@@ -411,7 +576,7 @@ if st.session_state.loaded:
         kw_text = st.text_area("Keywords (comma/newline)", value="", height=80)
         plan_name_keywords = parse_keywords(kw_text)
 
-        # Keep behavior consistent: plan names can still be ALL per carrier
+        # Plan names are always available per carrier (empty = ALL)
         enable_plan_name_filter = True
 
         st.divider()
@@ -553,30 +718,28 @@ if st.session_state.loaded:
 
                 if st.button("Apply these defaults to ALL selected carriers", use_container_width=True):
                     requested = set(bulk_types)
-
                     no_match_carriers = []
 
                     for carrier in selected_carriers_sorted:
-                        # classification
                         st.session_state.carrier_classification_map[carrier] = None if bulk_cls == "ALL" else bulk_cls
 
-                        # plan types: if requested types exist but none are valid for this carrier -> mark NO MATCH (None)
                         allowed = carrier_to_types.get(carrier, set())
                         valid = requested.intersection(allowed)
 
+                        # If user requested specific types but none exist for this carrier -> NO MATCH
                         if requested and not valid:
                             st.session_state.carrier_types_map[carrier] = None  # NO MATCH
                             no_match_carriers.append(carrier)
                         else:
-                            st.session_state.carrier_types_map[carrier] = set(valid)  # could be empty when requested empty => ALL
+                            st.session_state.carrier_types_map[carrier] = set(valid)  # empty when requested empty => ALL
 
-                        # keep plan names as ALL during bulk apply
+                        # Keep names as ALL on bulk apply
                         st.session_state.carrier_plan_names_map.setdefault(carrier, set())
 
                     if no_match_carriers:
                         st.warning(
                             f"{len(no_match_carriers)} carriers had **no matching plan types** for your bulk selection "
-                            f"(they are marked as **NO MATCH** and will remove 0 rows unless edited)."
+                            f"(marked as **NO MATCH**; they will remove 0 rows unless edited)."
                         )
                     else:
                         st.success("Applied defaults to all selected carriers.")
@@ -603,9 +766,7 @@ if st.session_state.loaded:
                         "Plan Names": "ALL" if not names_val else f"{len(names_val)} selected",
                     }
                 )
-
-            df_summary = pd.DataFrame(rows)
-            st.dataframe(df_summary, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             # ---- One-carrier editor ----
             st.divider()
@@ -622,6 +783,7 @@ if st.session_state.loaded:
                 # Classification
                 allowed_cls = sorted(list(carrier_to_classifications.get(carrier_to_edit, set())), key=lambda x: x.lower())
                 current_cls = st.session_state.carrier_classification_map.get(carrier_to_edit, None)
+
                 cls_options = ["ALL"] + allowed_cls
                 cls_index = 0
                 if current_cls is not None and current_cls in allowed_cls:
@@ -639,29 +801,27 @@ if st.session_state.loaded:
                 allowed_types = sorted(list(carrier_to_types.get(carrier_to_edit, set())), key=lambda x: x.lower())
                 stored_types = st.session_state.carrier_types_map.get(carrier_to_edit, set())
                 if stored_types is None:
-                    stored_types = set()  # show empty list, but keep note below
+                    stored_types = set()
 
                 current_types = sorted(list(stored_types), key=lambda x: x.lower())
-
                 types_choice = st.multiselect(
                     "Plan Types (leave empty = ALL)",
                     options=allowed_types,
                     default=current_types,
                     key=f"edit_types__{carrier_to_edit}",
                 )
-
-                # If user selects nothing: treat as ALL (empty set)
-                st.session_state.carrier_types_map[carrier_to_edit] = set(types_choice)
-
-                # if carrier was previously NO MATCH, clarify it
-                if st.session_state.carrier_types_map.get(carrier_to_edit) is None:
-                    st.warning("This carrier is currently NO MATCH for plan types. Select at least one valid type or leave empty for ALL.")
+                st.session_state.carrier_types_map[carrier_to_edit] = set(types_choice)  # empty => ALL
 
                 # Plan Names
                 st.caption("Plan Names (leave empty = ALL). Use search to filter.")
                 q = st.text_input("Search plan names", value="", key=f"edit_plan_search__{carrier_to_edit}")
+
                 all_names = sorted(list(carrier_to_plan_names.get(carrier_to_edit, set())), key=lambda x: (x or "").lower())
-                filtered_names = [n for n in all_names if q.strip().lower() in (n or "").lower()] if q.strip() else all_names
+                if q.strip():
+                    ql = q.strip().lower()
+                    filtered_names = [n for n in all_names if ql in (n or "").lower()]
+                else:
+                    filtered_names = all_names
 
                 current_names = st.session_state.carrier_plan_names_map.get(carrier_to_edit, set())
                 default_visible = sorted(list(current_names.intersection(set(filtered_names))), key=lambda x: (x or "").lower())
@@ -695,97 +855,57 @@ if st.session_state.loaded:
                             st.session_state.carrier_classification_map[c] = st.session_state.carrier_classification_map.get(
                                 carrier_to_edit, None
                             )
-                            st.session_state.carrier_types_map[c] = st.session_state.carrier_types_map.get(carrier_to_edit, set())
+                            st.session_state.carrier_types_map[c] = st.session_state.carrier_types_map.get(
+                                carrier_to_edit, set()
+                            )
                             st.session_state.carrier_plan_names_map[c] = set(
                                 st.session_state.carrier_plan_names_map.get(carrier_to_edit, set())
                             )
                         st.success(f"Copied settings to {len(copy_to)} carriers.")
 
-            # ---- Preview counts ----
+            # ---- Preview counts (FAST) ----
             st.divider()
             if st.button("Preview removal counts", use_container_width=True):
-                with st.spinner("Building preview..."):
-                    merged_tabs_preview: dict[str, pd.DataFrame] = {}
+                with st.spinner("Building preview (optimized)..."):
+                    tabs_preview = compute_removals_fast(
+                        input_long=st.session_state.input_long,
+                        db_small=st.session_state.db_small,
+                        selected_carriers=set(selected_carriers_sorted),
+                        carrier_classification_map=dict(st.session_state.carrier_classification_map),
+                        carrier_types_map=dict(st.session_state.carrier_types_map),
+                        carrier_plan_names_map=dict(st.session_state.carrier_plan_names_map),
+                        enable_plan_name_filter=enable_plan_name_filter,
+                        plan_name_keywords=list(plan_name_keywords),
+                    )
 
-                    for carrier in selected_carriers_sorted:
-                        per_types = st.session_state.carrier_types_map.get(carrier, set())
-                        if per_types is None:
-                            continue  # NO MATCH => skip carrier
-
-                        per_names = st.session_state.carrier_plan_names_map.get(carrier, set())
-
-                        tabs = compute_removals(
-                            input_df=st.session_state.input_df,
-                            plan_lookup=st.session_state.plan_lookup,
-                            selected_carriers={carrier},
-                            carrier_classification_map=dict(st.session_state.carrier_classification_map),
-                            selected_types_global=set(per_types),  # empty => ALL
-                            enable_plan_name_filter=enable_plan_name_filter,
-                            selected_plan_names=set(per_names),    # empty => ALL
-                            plan_name_keywords=list(plan_name_keywords),
-                        )
-
-                        for sheet, df in tabs.items():
-                            if sheet not in merged_tabs_preview:
-                                merged_tabs_preview[sheet] = df.copy()
-                            else:
-                                merged_tabs_preview[sheet] = pd.concat([merged_tabs_preview[sheet], df], ignore_index=True)
-
-                    for sheet, df in list(merged_tabs_preview.items()):
-                        merged_tabs_preview[sheet] = (
-                            df.drop_duplicates(subset=["ProviderId", "LocationId", "PlanId"])
-                            .reset_index(drop=True)
-                        )
-
-                preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in merged_tabs_preview.items()]
-                preview_df = pd.DataFrame(preview_rows).sort_values("MappingLevel")
+                preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in tabs_preview.items()]
+                preview_df = pd.DataFrame(preview_rows).sort_values("MappingLevel") if preview_rows else pd.DataFrame(columns=["MappingLevel", "Rows"])
                 total_preview = int(preview_df["Rows"].sum()) if not preview_df.empty else 0
                 st.success(f"Preview ready. Total rows: {total_preview}")
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-            # ---- Final output ----
+            # ---- Final output (FAST) ----
             st.divider()
             generate = st.button("FINAL: Generate Removal Output", type="primary", use_container_width=True)
             if generate:
-                with st.spinner("Computing removals..."):
-                    merged_tabs: dict[str, pd.DataFrame] = {}
+                with st.spinner("Computing removals (optimized)..."):
+                    tabs_final = compute_removals_fast(
+                        input_long=st.session_state.input_long,
+                        db_small=st.session_state.db_small,
+                        selected_carriers=set(selected_carriers_sorted),
+                        carrier_classification_map=dict(st.session_state.carrier_classification_map),
+                        carrier_types_map=dict(st.session_state.carrier_types_map),
+                        carrier_plan_names_map=dict(st.session_state.carrier_plan_names_map),
+                        enable_plan_name_filter=enable_plan_name_filter,
+                        plan_name_keywords=list(plan_name_keywords),
+                    )
 
-                    for carrier in selected_carriers_sorted:
-                        per_types = st.session_state.carrier_types_map.get(carrier, set())
-                        if per_types is None:
-                            continue  # NO MATCH => skip carrier
-
-                        per_names = st.session_state.carrier_plan_names_map.get(carrier, set())
-
-                        tabs = compute_removals(
-                            input_df=st.session_state.input_df,
-                            plan_lookup=st.session_state.plan_lookup,
-                            selected_carriers={carrier},
-                            carrier_classification_map=dict(st.session_state.carrier_classification_map),
-                            selected_types_global=set(per_types),  # empty => ALL
-                            enable_plan_name_filter=enable_plan_name_filter,
-                            selected_plan_names=set(per_names),    # empty => ALL
-                            plan_name_keywords=list(plan_name_keywords),
-                        )
-
-                        for sheet, df in tabs.items():
-                            if sheet not in merged_tabs:
-                                merged_tabs[sheet] = df.copy()
-                            else:
-                                merged_tabs[sheet] = pd.concat([merged_tabs[sheet], df], ignore_index=True)
-
-                    for sheet, df in list(merged_tabs.items()):
-                        merged_tabs[sheet] = (
-                            df.drop_duplicates(subset=["ProviderId", "LocationId", "PlanId"])
-                            .reset_index(drop=True)
-                        )
-
-                total_rows = sum(len(df) for df in merged_tabs.values())
+                total_rows = sum(len(df) for df in tabs_final.values())
                 if total_rows == 0:
                     st.warning("No removals matched.")
                 else:
-                    st.success(f"Removals: {total_rows} rows | Tabs: {len(merged_tabs)}")
-                    xbytes = make_excel_bytes(merged_tabs)
+                    st.success(f"Removals: {total_rows} rows | Tabs: {len(tabs_final)}")
+                    xbytes = make_excel_bytes(tabs_final)
                     st.download_button(
                         "Download removal_output.xlsx",
                         data=xbytes,
