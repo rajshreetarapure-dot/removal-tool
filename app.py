@@ -507,28 +507,29 @@ if st.session_state.loaded:
                 # default plan types = ALL (empty set means ALL)
                 st.session_state.carrier_types_map.setdefault(c, set())
 
-       # ---- Stable carrier multiselect ----
 # ---- Stable carrier multiselect ----
+shown_carriers = displayed_carriers if "displayed_carriers" in locals() else st.session_state.all_carriers
+
 if "carrier_widget_value" not in st.session_state:
     st.session_state.carrier_widget_value = []
 
 # Initialize widget value from stored selection (first run only)
 if not st.session_state.carrier_widget_value:
     st.session_state.carrier_widget_value = sorted(
-        list(st.session_state.selected_carriers.intersection(set(displayed_carriers))),
+        list(st.session_state.selected_carriers.intersection(set(shown_carriers))),
         key=lambda x: x.lower(),
     )
 
 selected_now = st.multiselect(
     "Select carriers",
-    options=displayed_carriers,
+    options=shown_carriers,
     key="carrier_widget_value",
     label_visibility="collapsed",
 )
 
 # Merge hidden selections (important when searching)
 prev = set(st.session_state.selected_carriers)
-shown = set(displayed_carriers)
+shown = set(shown_carriers)
 picked = set(selected_now)
 
 keep_hidden = prev - shown
@@ -696,6 +697,7 @@ if enable_plan_name_filter and st.session_state.selected_carriers:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
 
 
 
