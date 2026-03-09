@@ -237,11 +237,13 @@ if "selected_carriers" not in st.session_state:
 if "carrier_classification_map" not in st.session_state:
     st.session_state.carrier_classification_map = {}
 
+# carrier -> set(types) ; empty set = ALL ; None = NO MATCH (skip carrier)
 if "carrier_types_map" not in st.session_state:
-    st.session_state.carrier_types_map = {}  # carrier -> set(types); empty = ALL
+    st.session_state.carrier_types_map = {}
 
+# carrier -> set(names) ; empty set = ALL
 if "carrier_plan_names_map" not in st.session_state:
-    st.session_state.carrier_plan_names_map = {}  # carrier -> set(names); empty = ALL
+    st.session_state.carrier_plan_names_map = {}
 
 if "carrier_widget_value" not in st.session_state:
     st.session_state.carrier_widget_value = []
@@ -252,7 +254,7 @@ if "active_global_class_filter" not in st.session_state:
 if "loaded" not in st.session_state:
     st.session_state.loaded = False
 
-# Bulk defaults (UI only)
+# Bulk defaults
 if "bulk_default_classification" not in st.session_state:
     st.session_state.bulk_default_classification = "ALL"
 if "bulk_default_types" not in st.session_state:
@@ -377,12 +379,12 @@ if st.session_state.loaded:
     carrier_to_types = universe["carrier_to_types"]
 
     # ---------------------------
-    # SIDEBAR: Filters + plan-name keywords (optional)
+    # SIDEBAR: Filters + clearer search explanation + plan-name keywords
     # ---------------------------
     with st.sidebar:
-        st.header("Controls")
+        st.header("Filters & Search")
 
-        st.caption("Global classification filter (optional)")
+        st.caption("Plan Classification (optional filter for the carrier list)")
         class_filter = st.selectbox(
             "Plan Classification",
             options=["(none)"] + st.session_state.all_classifications,
@@ -390,15 +392,27 @@ if st.session_state.loaded:
             format_func=lambda x: "All classifications" if x == "(none)" else x,
         )
 
-        st.caption("Search (filters carrier list by Carrier OR Plan Name)")
-        carrier_search = st.text_input("Search", value="")
+        st.divider()
+
+        st.caption("🔎 Carrier / Plan Name Search")
+        st.write(
+            "Type a **carrier name** (example: *Cigna*) or a **plan name keyword** (example: *open*, *medicaid*). "
+            "This filters the **carrier list** on the left."
+        )
+        carrier_search = st.text_input(
+            "Search carriers or plan names",
+            value="",
+            placeholder="Example: cigna OR open OR medicaid",
+        )
 
         st.divider()
 
-        st.caption("Plan name keywords (optional)")
+        st.caption("Plan name keywords (optional, applies during removal)")
         kw_text = st.text_area("Keywords (comma/newline)", value="", height=80)
         plan_name_keywords = parse_keywords(kw_text)
-        enable_plan_name_filter = True  # keep behavior consistent: per-carrier names can still be ALL
+
+        # Keep behavior consistent: plan names can still be ALL per carrier
+        enable_plan_name_filter = True
 
         st.divider()
         miss = st.session_state.missing_plan_ids_count
@@ -436,7 +450,7 @@ if st.session_state.loaded:
     left, right = st.columns([2, 1], gap="large")
 
     # ---------------------------
-    # LEFT: Carrier selection ONLY (fast for 100+)
+    # LEFT: Carrier selection ONLY
     # ---------------------------
     with left:
         st.markdown("### 1) Pick Carriers")
@@ -498,9 +512,9 @@ if st.session_state.loaded:
 
         st.markdown("### Tips")
         st.caption(
-            "- Pick carriers on the left.\n"
-            "- Use the right panel to edit **only** the carriers that need specific Plan Types / Plan Names.\n"
-            "- If you don’t edit a carrier, it stays as **ALL** (remove everything for that carrier)."
+            "- Pick carriers here.\n"
+            "- Use the right panel to edit only the carriers that need specific filters.\n"
+            "- If you don’t edit a carrier, it stays as ALL (remove everything under that carrier)."
         )
 
     # ---------------------------
@@ -513,9 +527,15 @@ if st.session_state.loaded:
         if not selected_carriers_sorted:
             st.info("Select carriers to enable editing + preview + output.")
         else:
-            # ---- Bulk defaults (applies to all selected carriers) ----
+            st.info(
+                "📝 **How Plan Types work:**\n"
+                "- **ALL** (no types selected) means remove all plan types for that carrier.\n"
+                "- If you select types (example: HMO) but a carrier has **no matching types**, it becomes **NO MATCH** and will remove **0 rows**.\n"
+            )
+
+            # ---- Bulk defaults ----
             with st.expander("Bulk apply defaults to selected carriers", expanded=False):
-                st.caption("This is useful when a request is broad (e.g., Medicaid-only across many carriers).")
+                st.caption("Useful for broad requests (e.g., Federal + HMO across many carriers).")
 
                 bulk_cls = st.selectbox(
                     "Default Plan Classification",
@@ -524,7 +544,6 @@ if st.session_state.loaded:
                     key="bulk_default_classification",
                 )
 
-                # NOTE: global list; some carriers may not have all types — we validate per carrier on apply
                 bulk_types = st.multiselect(
                     "Default Plan Types (leave empty = ALL)",
                     options=st.session_state.all_types,
@@ -533,30 +552,58 @@ if st.session_state.loaded:
                 )
 
                 if st.button("Apply these defaults to ALL selected carriers", use_container_width=True):
+                    requested = set(bulk_types)
+
+                    no_match_carriers = []
+
                     for carrier in selected_carriers_sorted:
+                        # classification
                         st.session_state.carrier_classification_map[carrier] = None if bulk_cls == "ALL" else bulk_cls
 
+                        # plan types: if requested types exist but none are valid for this carrier -> mark NO MATCH (None)
                         allowed = carrier_to_types.get(carrier, set())
-                        st.session_state.carrier_types_map[carrier] = set([t for t in bulk_types if t in allowed])
+                        valid = requested.intersection(allowed)
 
-                        # keep names as ALL (empty set) on bulk apply to avoid unintended specificity
+                        if requested and not valid:
+                            st.session_state.carrier_types_map[carrier] = None  # NO MATCH
+                            no_match_carriers.append(carrier)
+                        else:
+                            st.session_state.carrier_types_map[carrier] = set(valid)  # could be empty when requested empty => ALL
+
+                        # keep plan names as ALL during bulk apply
                         st.session_state.carrier_plan_names_map.setdefault(carrier, set())
-                    st.success("Applied defaults to all selected carriers.")
+
+                    if no_match_carriers:
+                        st.warning(
+                            f"{len(no_match_carriers)} carriers had **no matching plan types** for your bulk selection "
+                            f"(they are marked as **NO MATCH** and will remove 0 rows unless edited)."
+                        )
+                    else:
+                        st.success("Applied defaults to all selected carriers.")
 
             # ---- Summary table ----
             rows = []
             for carrier in selected_carriers_sorted:
                 cls_val = st.session_state.carrier_classification_map.get(carrier, None)
-                types_val = st.session_state.carrier_types_map.get(carrier, set()) or set()
+                types_val = st.session_state.carrier_types_map.get(carrier, set())
                 names_val = st.session_state.carrier_plan_names_map.get(carrier, set()) or set()
+
+                if types_val is None:
+                    types_label = "NO MATCH (0 rows)"
+                elif not types_val:
+                    types_label = "ALL"
+                else:
+                    types_label = f"{len(types_val)} selected"
+
                 rows.append(
                     {
                         "Carrier": carrier,
                         "Plan Classification": cls_val if cls_val is not None else "ALL",
-                        "Plan Types": "ALL" if not types_val else f"{len(types_val)} selected",
+                        "Plan Types": types_label,
                         "Plan Names": "ALL" if not names_val else f"{len(names_val)} selected",
                     }
                 )
+
             df_summary = pd.DataFrame(rows)
             st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
@@ -590,14 +637,25 @@ if st.session_state.loaded:
 
                 # Plan Types
                 allowed_types = sorted(list(carrier_to_types.get(carrier_to_edit, set())), key=lambda x: x.lower())
-                current_types = sorted(list(st.session_state.carrier_types_map.get(carrier_to_edit, set())), key=lambda x: x.lower())
+                stored_types = st.session_state.carrier_types_map.get(carrier_to_edit, set())
+                if stored_types is None:
+                    stored_types = set()  # show empty list, but keep note below
+
+                current_types = sorted(list(stored_types), key=lambda x: x.lower())
+
                 types_choice = st.multiselect(
                     "Plan Types (leave empty = ALL)",
                     options=allowed_types,
                     default=current_types,
                     key=f"edit_types__{carrier_to_edit}",
                 )
+
+                # If user selects nothing: treat as ALL (empty set)
                 st.session_state.carrier_types_map[carrier_to_edit] = set(types_choice)
+
+                # if carrier was previously NO MATCH, clarify it
+                if st.session_state.carrier_types_map.get(carrier_to_edit) is None:
+                    st.warning("This carrier is currently NO MATCH for plan types. Select at least one valid type or leave empty for ALL.")
 
                 # Plan Names
                 st.caption("Plan Names (leave empty = ALL). Use search to filter.")
@@ -637,7 +695,7 @@ if st.session_state.loaded:
                             st.session_state.carrier_classification_map[c] = st.session_state.carrier_classification_map.get(
                                 carrier_to_edit, None
                             )
-                            st.session_state.carrier_types_map[c] = set(st.session_state.carrier_types_map.get(carrier_to_edit, set()))
+                            st.session_state.carrier_types_map[c] = st.session_state.carrier_types_map.get(carrier_to_edit, set())
                             st.session_state.carrier_plan_names_map[c] = set(
                                 st.session_state.carrier_plan_names_map.get(carrier_to_edit, set())
                             )
@@ -651,6 +709,9 @@ if st.session_state.loaded:
 
                     for carrier in selected_carriers_sorted:
                         per_types = st.session_state.carrier_types_map.get(carrier, set())
+                        if per_types is None:
+                            continue  # NO MATCH => skip carrier
+
                         per_names = st.session_state.carrier_plan_names_map.get(carrier, set())
 
                         tabs = compute_removals(
@@ -691,6 +752,9 @@ if st.session_state.loaded:
 
                     for carrier in selected_carriers_sorted:
                         per_types = st.session_state.carrier_types_map.get(carrier, set())
+                        if per_types is None:
+                            continue  # NO MATCH => skip carrier
+
                         per_names = st.session_state.carrier_plan_names_map.get(carrier, set())
 
                         tabs = compute_removals(
