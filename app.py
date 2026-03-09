@@ -508,7 +508,7 @@ if st.session_state.loaded:
                 st.session_state.carrier_types_map.setdefault(c, set())
 
        # ---- Stable carrier multiselect ----
-
+# ---- Stable carrier multiselect ----
 if "carrier_widget_value" not in st.session_state:
     st.session_state.carrier_widget_value = []
 
@@ -538,13 +538,28 @@ st.session_state.selected_carriers = keep_hidden | picked
 newly_selected = st.session_state.selected_carriers - prev
 active_cls = st.session_state.active_global_class_filter
 
-for c in newly_selected:
+for carrier in newly_selected:
     if active_cls is not None:
-        st.session_state.carrier_classification_map[c] = active_cls
+        st.session_state.carrier_classification_map[carrier] = active_cls
     else:
-        st.session_state.carrier_classification_map.setdefault(c, None)
+        st.session_state.carrier_classification_map.setdefault(carrier, None)
 
-    st.session_state.carrier_types_map.setdefault(c, set())
+    st.session_state.carrier_types_map.setdefault(carrier, set())
+
+# Optional: plan-name explicit picking only when enabled  ✅ OUTSIDE the loop
+if enable_plan_name_filter and st.session_state.selected_carriers:
+    with st.expander("Optional: pick specific Plan Names (instead of keywords)", expanded=False):
+        plan_names_pool = set()
+        for carrier in st.session_state.selected_carriers:
+            plan_names_pool |= carrier_to_plan_names.get(carrier, set())
+        plan_names_pool = sorted(list(plan_names_pool), key=lambda x: x.lower())
+
+        pick_all_names = st.checkbox("Select all plan names shown", value=False)
+        if pick_all_names:
+            selected_plan_names = set(plan_names_pool)
+            st.write(f"Selected {len(selected_plan_names)} plan names.")
+        else:
+            selected_plan_names = set(st.multiselect("Plan Names", options=plan_names_pool, default=[]))
         # Optional: plan-name explicit picking only when enabled
         if enable_plan_name_filter and st.session_state.selected_carriers:
             with st.expander("Optional: pick specific Plan Names (instead of keywords)", expanded=False):
@@ -681,5 +696,6 @@ for c in newly_selected:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+
 
 
