@@ -77,13 +77,6 @@ def extract_input_plan_ids(input_df: pd.DataFrame) -> set[str]:
     return plan_ids
 
 
-def parse_keywords(text: str) -> list[str]:
-    if not text:
-        return []
-    parts = re.split(r"[,\n]+", text)
-    return [p.strip() for p in parts if p.strip()]
-
-
 def read_deprecated_plan_ids(dep_df: pd.DataFrame) -> set[str]:
     col = None
     for c in DEPRECATED_ACCEPTABLE_PLAN_ID_COLS:
@@ -208,7 +201,6 @@ def compute_removals_fast(
 
     # Apply plan rules (specific carrier overrides wildcard)
     if active_plan_rules:
-        # assign rule key
         rule_key = []
         for cls, car in zip(df["Plan Classification"], df["Carrier_Name"]):
             if (cls, car) in active_plan_rules:
@@ -302,6 +294,14 @@ def stable_key(*parts: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+def ms_key_for(cls: str, carrier: str) -> str:
+    return f"ms__{stable_key(cls, carrier)}"
+
+
+def proc_key_for(cls: str, carrier: str) -> str:
+    return f"proc__{stable_key(cls, carrier)}"
+
+
 # -----------------------------
 # Session state init
 # -----------------------------
@@ -333,6 +333,7 @@ if "bulk_default_types" not in st.session_state:
 if "explorer_selected_names" not in st.session_state:
     st.session_state.explorer_selected_names = {}
 
+# carriers selected in explorer (target carriers)
 if "explorer_carriers_selected" not in st.session_state:
     st.session_state.explorer_carriers_selected = []
 
@@ -561,14 +562,10 @@ if st.session_state.loaded:
         st.button("Add selected carriers", use_container_width=True, disabled=disabled_pick, on_click=add_selected_carriers)
 
         # ---------------------------
-        # Plan Name Explorer (SMART + WORKING buttons)
+        # Plan Name Explorer
         # ---------------------------
         st.divider()
         st.markdown("### 2) Plan Name Explorer (smart)")
-        st.caption(
-            "Enter a plan keyword → see carriers + matching plan names → select exceptions/removals → Confirm.\n"
-            "Does NOT change carrier selection unless you explicitly add carriers."
-        )
 
         explorer_kw = st.text_input(
             "Plan keyword",
@@ -589,7 +586,7 @@ if st.session_state.loaded:
             key="explorer_mode",
         )
 
-        # Build explorer results from DB for this classification + keyword
+        # Build carrier -> matching plan names
         by_carrier = {}
         if (not disabled_pick) and explorer_kw.strip():
             kw = explorer_kw.strip()
@@ -618,7 +615,7 @@ if st.session_state.loaded:
             total_plans = sum(len(v) for v in by_carrier.values())
             st.success(f"Found {total_plans} matching plan names across {len(carriers_found)} carriers.")
 
-            # Choose carriers to apply this rule to (default = all carriers found)
+            # Carriers to apply this selection to
             if not st.session_state.explorer_carriers_selected:
                 st.session_state.explorer_carriers_selected = list(carriers_found)
 
@@ -639,25 +636,25 @@ if st.session_state.loaded:
                 options=carriers_found,
                 key="explorer_carriers_selected",
             )
-
             selected_carriers_for_rule = list(st.session_state.explorer_carriers_selected)
 
-            # Global plan actions for selected carriers
+            # --- Global Plan actions that REALLY work ---
             def explorer_select_all_plans_global():
                 cls = st.session_state.active_global_class_filter
                 if not cls:
                     return
                 for car in selected_carriers_for_rule:
-                    key = (cls, car)
-                    st.session_state.explorer_selected_names[key] = set(by_carrier.get(car, set()))
+                    plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
+                    st.session_state.explorer_selected_names[(cls, car)] = set(plans)
+                    st.session_state[ms_key_for(cls, car)] = plans  # IMPORTANT: update widget state
 
             def explorer_clear_all_plans_global():
                 cls = st.session_state.active_global_class_filter
                 if not cls:
                     return
                 for car in selected_carriers_for_rule:
-                    key = (cls, car)
-                    st.session_state.explorer_selected_names[key] = set()
+                    st.session_state.explorer_selected_names[(cls, car)] = set()
+                    st.session_state[ms_key_for(cls, car)] = []  # IMPORTANT: update widget state
 
             pp1, pp2 = st.columns(2)
             with pp1:
@@ -665,8 +662,8 @@ if st.session_state.loaded:
             with pp2:
                 st.button("Clear ALL selected plan names", use_container_width=True, on_click=explorer_clear_all_plans_global)
 
-            # Per-carrier plan-name picker (multiselect, not checkboxes)
             st.caption("Pick plan names per carrier (fast + reliable).")
+
             MAX_RENDER = 25
             if len(selected_carriers_for_rule) > MAX_RENDER:
                 st.warning(f"Showing first {MAX_RENDER} carriers. Narrow keyword if needed.")
@@ -674,70 +671,102 @@ if st.session_state.loaded:
 
             for car in render_carriers:
                 plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
-                key_bucket = (active_cls, car)
-                current = set(st.session_state.explorer_selected_names.get(key_bucket, set()) or set())
+                bucket = (active_cls, car)
+                current = set(st.session_state.explorer_selected_names.get(bucket, set()) or set())
 
-                exp_label = f"{car} — selected {len(current)} / {len(plans)}"
+                # Ensure widget key exists (so buttons can set it)
+                msk = ms_key_for(active_cls, car)
+                if msk not in st.session_state:
+                    # initialize widget value from stored selection
+                    st.session_state[msk] = sorted(list(current.intersection(set(plans))), key=lambda x: (x or "").lower())
+
+                # Default processing checkbox:
+                # - if carrier already in Summary selection -> checked True
+                # - else unchecked (user decides if this carrier should be removed)
+                pk = proc_key_for(active_cls, car)
+                if pk not in st.session_state:
+                    st.session_state[pk] = ((car, active_cls) in st.session_state.selected_pairs)
+
+                selected_count = len(set(st.session_state[msk]))
+                exp_label = f"{car} — selected {selected_count} / {len(plans)}"
+
                 with st.expander(exp_label, expanded=False):
-                    # per-carrier buttons
+                    # Process toggle (THIS is what you asked for)
+                    st.checkbox(
+                        "Process this carrier (add to Summary if missing)",
+                        key=pk,
+                        help="If checked, Confirm/Apply will ensure this carrier is included in Summary and apply the rule.",
+                    )
+
+                    # Per-carrier select all / clear that updates WIDGET state too
                     def _sel_all_carrier(carrier=car):
-                        k = (st.session_state.active_global_class_filter, carrier)
-                        st.session_state.explorer_selected_names[k] = set(by_carrier.get(carrier, set()))
+                        cls = st.session_state.active_global_class_filter
+                        if not cls:
+                            return
+                        allp = sorted(list(by_carrier.get(carrier, set())), key=lambda x: (x or "").lower())
+                        st.session_state.explorer_selected_names[(cls, carrier)] = set(allp)
+                        st.session_state[ms_key_for(cls, carrier)] = allp
 
                     def _clear_carrier(carrier=car):
-                        k = (st.session_state.active_global_class_filter, carrier)
-                        st.session_state.explorer_selected_names[k] = set()
+                        cls = st.session_state.active_global_class_filter
+                        if not cls:
+                            return
+                        st.session_state.explorer_selected_names[(cls, carrier)] = set()
+                        st.session_state[ms_key_for(cls, carrier)] = []
 
                     b1, b2 = st.columns(2)
                     with b1:
-                        st.button("Select all for this carrier", use_container_width=True, on_click=_sel_all_carrier, key=f"sel_all_{stable_key(active_cls, car)}")
+                        st.button(
+                            "Select all for this carrier",
+                            use_container_width=True,
+                            on_click=_sel_all_carrier,
+                            key=f"sel_all_{stable_key(active_cls, car)}",
+                        )
                     with b2:
-                        st.button("Clear for this carrier", use_container_width=True, on_click=_clear_carrier, key=f"clr_{stable_key(active_cls, car)}")
+                        st.button(
+                            "Clear for this carrier",
+                            use_container_width=True,
+                            on_click=_clear_carrier,
+                            key=f"clr_{stable_key(active_cls, car)}",
+                        )
 
-                    # multiselect (source of truth for this carrier)
-                    default_vals = sorted(list(current.intersection(set(plans))), key=lambda x: (x or "").lower())
                     picked = st.multiselect(
                         "Plan names",
                         options=plans,
-                        default=default_vals,
-                        key=f"ms_{stable_key(active_cls, car)}",
+                        key=msk,  # widget state is source of truth
                     )
-                    st.session_state.explorer_selected_names[key_bucket] = set(picked)
+                    st.session_state.explorer_selected_names[bucket] = set(picked)
 
             st.divider()
 
-            # Optional helper: add found carriers to summary selection
-            st.markdown("### Optional: Add these carriers to your selection")
-            st.caption("This adds (carrier, classification) pairs to Summary. It does not affect plan rules.")
-            def add_found_carriers_to_selection():
-                cls = st.session_state.active_global_class_filter
-                if not cls:
-                    return
-                for car in selected_carriers_for_rule:
-                    pair = (car, cls)
-                    st.session_state.selected_pairs.add(pair)
-                    st.session_state.pair_types_map.setdefault(pair, set())
-
-            st.button(
-                "Add selected explorer carriers into Summary selection",
-                use_container_width=True,
-                on_click=add_found_carriers_to_selection,
-            )
-
-            # Apply rule
+            # Confirm / Apply
             def apply_explorer_rule():
                 cls = st.session_state.active_global_class_filter
                 if not cls:
                     return
-                mode = st.session_state.get("explorer_mode", "")
+
+                mode_label = st.session_state.get("explorer_mode", "")
+                rule_mode = "ALL_EXCEPT" if mode_label.startswith("ALLOW") else "ONLY"
+
                 applied = 0
+                added_to_summary = 0
 
                 for car in selected_carriers_for_rule:
+                    # Only apply if user chose "process this carrier"
+                    if not st.session_state.get(proc_key_for(cls, car), False):
+                        continue
+
                     names = set(st.session_state.explorer_selected_names.get((cls, car), set()) or set())
                     if not names:
                         continue
 
-                    rule_mode = "ALL_EXCEPT" if mode.startswith("ALLOW") else "ONLY"
+                    # Ensure carrier is in Summary selection
+                    pair = (car, cls)
+                    if pair not in st.session_state.selected_pairs:
+                        st.session_state.selected_pairs.add(pair)
+                        st.session_state.pair_types_map.setdefault(pair, set())
+                        added_to_summary += 1
+
                     st.session_state.active_plan_rules[(cls, car)] = {
                         "mode": rule_mode,
                         "names": set(names),
@@ -746,9 +775,12 @@ if st.session_state.loaded:
                     applied += 1
 
                 if applied == 0:
-                    st.warning("Nothing applied: select at least 1 plan name under at least 1 carrier.")
+                    st.warning("Nothing applied. For at least one carrier: check 'Process this carrier' and select at least 1 plan name.")
                 else:
-                    st.success(f"Applied plan-name rule to {applied} carriers for classification {cls}.")
+                    msg = f"Applied plan-name rules to {applied} carriers for {cls}."
+                    if added_to_summary:
+                        msg += f" Added {added_to_summary} carriers into Summary."
+                    st.success(msg)
 
             def clear_rules_for_this_class():
                 cls = st.session_state.active_global_class_filter
@@ -757,6 +789,7 @@ if st.session_state.loaded:
                 to_del = [k for k in list(st.session_state.active_plan_rules.keys()) if k[0] == cls]
                 for k in to_del:
                     st.session_state.active_plan_rules.pop(k, None)
+                st.success(f"Cleared ACTIVE rules for {cls}.")
 
             ap1, ap2 = st.columns(2)
             with ap1:
@@ -765,7 +798,7 @@ if st.session_state.loaded:
                 st.button("🧹 Clear ACTIVE rules for this classification", use_container_width=True, on_click=clear_rules_for_this_class)
 
     # ---------------------------
-    # RIGHT: Summary + show plan-name rule counts + preview + generate
+    # RIGHT: Summary
     # ---------------------------
     with right:
         st.markdown("### Summary (what will be processed)")
@@ -822,48 +855,8 @@ if st.session_state.loaded:
                 st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
 
             st.divider()
-            st.markdown("### Remove selected rows (explicit)")
-            labels = [f"{c} | {cls}" for (c, cls) in selected_pairs_sorted]
-            remove_pick = st.multiselect("Choose rows to remove", options=labels, default=[], key="remove_pick")
-            if st.button("Remove chosen rows", use_container_width=True, disabled=not remove_pick):
-                remove_set = set()
-                for lab in remove_pick:
-                    c, cls = [p.strip() for p in lab.split("|", 1)]
-                    remove_set.add((c, cls))
-                st.session_state.selected_pairs -= remove_set
-                for pair in remove_set:
-                    st.session_state.pair_types_map.pop(pair, None)
-                st.success(f"Removed {len(remove_set)} rows.")
-                st.session_state.remove_pick = []
+            st.markdown("### Preview / Generate")
 
-            st.divider()
-            with st.expander("Bulk apply plan types to ALL selected rows", expanded=False):
-                st.multiselect(
-                    "Default Plan Types (leave empty = ALL)",
-                    options=st.session_state.all_types,
-                    default=st.session_state.bulk_default_types,
-                    key="bulk_default_types",
-                )
-
-                def apply_bulk_types():
-                    requested = set(st.session_state.get("bulk_default_types", []))
-                    no_match = 0
-                    for (carrier, cls) in st.session_state.selected_pairs:
-                        allowed = carrier_to_types.get(carrier, set())
-                        valid = requested.intersection(allowed)
-                        if requested and not valid:
-                            st.session_state.pair_types_map[(carrier, cls)] = None
-                            no_match += 1
-                        else:
-                            st.session_state.pair_types_map[(carrier, cls)] = set(valid)
-                    if no_match:
-                        st.warning(f"{no_match} rows marked NO MATCH for your type selection.")
-                    else:
-                        st.success("Applied plan types.")
-
-                st.button("Apply plan types", use_container_width=True, on_click=apply_bulk_types)
-
-            st.divider()
             if st.button("Preview removal counts", use_container_width=True):
                 with st.spinner("Building preview..."):
                     tabs_preview = compute_removals_fast(
@@ -883,7 +876,6 @@ if st.session_state.loaded:
                 st.success(f"Preview ready. Total rows: {total_preview}")
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-            st.divider()
             generate = st.button("FINAL: Generate Removal Output", type="primary", use_container_width=True)
             if generate:
                 with st.spinner("Computing removals..."):
