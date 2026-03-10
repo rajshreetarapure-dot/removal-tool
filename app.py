@@ -15,7 +15,7 @@ DEPRECATED_ACCEPTABLE_PLAN_ID_COLS = ["Plan_ID", "PlanId", "plan_id", "planid"]
 
 
 # -----------------------------
-# Helpers (original logic kept)
+# Helpers
 # -----------------------------
 def split_csv_ids(cell_value: str):
     if cell_value is None:
@@ -122,16 +122,18 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
 
 
 # -----------------------------
-# ORIGINAL removal logic (updated to work with selected_pairs)
+# Removal logic (pair-based) with preserve support
 # -----------------------------
 def compute_removals(
     input_df: pd.DataFrame,
     plan_lookup: dict,
     selected_pairs: set[tuple[str, str]],  # (carrier, classification)
-    pair_types_map: dict[tuple[str, str], set[str] | None],  # empty=set() => ALL; None => NO MATCH
+    pair_types_map: dict[tuple[str, str], set[str] | None],
     enable_plan_name_filter: bool,
-    pair_plan_names_map: dict[tuple[str, str], set[str]],  # empty=set() => ALL
+    pair_plan_names_map: dict[tuple[str, str], set[str]],
     plan_name_keywords: list[str],
+    preserve_plan_names: set[str],
+    preserve_scope: str,  # "(All)" or a classification name
 ):
     def plan_name_matches(pair_key: tuple[str, str], name: str) -> bool:
         if not enable_plan_name_filter:
@@ -173,6 +175,13 @@ def compute_removals(
 
             ptype = normalize_str(info.get("Plan_Type")) or "(blank)"
             pname = normalize_str(info.get("Plan_Name")) or "(blank)"
+
+            # Preserve logic: if plan name is in preserve set and scope matches, skip removal (i.e., do not add)
+            if preserve_plan_names:
+                if preserve_scope == "(All)" or preserve_scope == pcl:
+                    if pname in preserve_plan_names:
+                        # skip removing this plan (preserve it)
+                        continue
 
             types_val = pair_types_map.get(pair_key, set())
             if types_val is None:
@@ -234,13 +243,9 @@ def read_deprecated_plan_ids(dep_df: pd.DataFrame) -> set[str]:
 
 
 # -----------------------------
-# Performance helpers (fast path; updated to work with selected_pairs)
+# Fast helpers (vectorized) with preserve support
 # -----------------------------
 def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Explode input PlanIds into a long table once:
-      MappingLevel, ProviderId, LocationId, PlanId
-    """
     base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
     base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
     base = base.explode("PlanId").drop(columns=["PlanIds"])
@@ -252,11 +257,13 @@ def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
 def compute_removals_fast(
     input_long: pd.DataFrame,
     db_small: pd.DataFrame,
-    selected_pairs: set[tuple[str, str]],                 # {(Carrier_Name, Plan Classification), ...}
-    pair_types_map: dict[tuple[str, str], set[str] | None],  # pair -> set(types); empty=set() => ALL; None => NO MATCH
-    pair_plan_names_map: dict[tuple[str, str], set[str]],    # pair -> set(names); empty=set() => ALL
+    selected_pairs: set[tuple[str, str]],
+    pair_types_map: dict[tuple[str, str], set[str] | None],
+    pair_plan_names_map: dict[tuple[str, str], set[str]],
     enable_plan_name_filter: bool,
     plan_name_keywords: list[str],
+    preserve_plan_names: set[str],
+    preserve_scope: str,
 ) -> dict[str, pd.DataFrame]:
     if not selected_pairs:
         return {}
@@ -273,7 +280,6 @@ def compute_removals_fast(
     if df.empty:
         return {}
 
-    # Normalize
     df["Carrier_Name"] = df["Carrier_Name"].astype(str).map(normalize_str)
     df["Plan_Type"] = df["Plan_Type"].astype(str).map(normalize_str)
     df["Plan Classification"] = df["Plan Classification"].astype(str).map(normalize_str)
@@ -283,11 +289,21 @@ def compute_removals_fast(
     df.loc[df["Plan Classification"] == "", "Plan Classification"] = "(blank)"
     df.loc[df["Plan_Name"] == "", "Plan_Name"] = "(blank)"
 
-    # Filter to selected pairs via merge (fast + clean)
     allow_df = pd.DataFrame(list(selected_pairs), columns=["Carrier_Name", "Plan Classification"])
     df = df.merge(allow_df, on=["Carrier_Name", "Plan Classification"], how="inner", copy=False)
     if df.empty:
         return {}
+
+    # Preserve mask: remove rows from consideration that should be preserved (i.e., NOT removed)
+    if preserve_plan_names:
+        if preserve_scope == "(All)":
+            mask_preserve = df["Plan_Name"].isin(preserve_plan_names)
+        else:
+            mask_preserve = df["Plan_Name"].isin(preserve_plan_names) & (df["Plan Classification"] == preserve_scope)
+        # Keep rows that are NOT preserved (we only want rows eligible for removal)
+        df = df[~mask_preserve].copy()
+        if df.empty:
+            return {}
 
     # Remove NO MATCH pairs
     no_match_pairs = {k for k, v in pair_types_map.items() if v is None}
@@ -307,9 +323,6 @@ def compute_removals_fast(
                 allow_rows.append((carrier, cls, t))
         allow_types_df = pd.DataFrame(allow_rows, columns=["Carrier_Name", "Plan Classification", "Plan_Type"])
 
-        # Keep:
-        # - all rows from pairs not in restricted_types (ALL types)
-        # - only matching Plan_Type rows for restricted pairs
         restricted_pairs_df = pd.DataFrame(list(restricted_types.keys()), columns=["Carrier_Name", "Plan Classification"])
         df_restr = df.merge(restricted_pairs_df, on=["Carrier_Name", "Plan Classification"], how="inner")
         df_all = df.merge(restricted_pairs_df.assign(__r=1), on=["Carrier_Name", "Plan Classification"], how="left")
@@ -328,7 +341,6 @@ def compute_removals_fast(
         do_name_filter = any_explicit or any_kw
 
     if do_name_filter:
-        # Keyword mask
         if plan_name_keywords:
             kws = [k for k in plan_name_keywords if k]
             if kws:
@@ -339,7 +351,6 @@ def compute_removals_fast(
         else:
             kw_mask = pd.Series(False, index=df.index)
 
-        # Explicit names mask per pair
         restricted_names = {k: v for k, v in pair_plan_names_map.items() if isinstance(v, set) and len(v) > 0}
         name_mask = pd.Series(False, index=df.index)
         if restricted_names:
@@ -355,14 +366,12 @@ def compute_removals_fast(
             if not matched.empty:
                 name_mask.loc[matched["_idx"].values] = True
 
-        # Pairs with ALL names (empty set) should pass name filter unless explicit restriction exists
         pairs_all_names = {k for k, v in pair_plan_names_map.items() if isinstance(v, set) and len(v) == 0}
         if restricted_names:
             restricted_pairs = set(restricted_names.keys())
         else:
             restricted_pairs = set()
 
-        # Row is "all names" if its pair is in pairs_all_names OR its pair not explicitly restricted
         pair_key_series = list(zip(df["Carrier_Name"], df["Plan Classification"]))
         pair_all_mask = pd.Series(
             [(pk in pairs_all_names) or (pk not in restricted_pairs) for pk in pair_key_series],
@@ -391,11 +400,9 @@ def compute_removals_fast(
 if "selected_pairs" not in st.session_state:
     st.session_state.selected_pairs = set()  # {(carrier, classification)}
 
-# pair -> set(types); empty=set() => ALL; None => NO MATCH
 if "pair_types_map" not in st.session_state:
     st.session_state.pair_types_map = {}
 
-# pair -> set(names); empty=set() => ALL
 if "pair_plan_names_map" not in st.session_state:
     st.session_state.pair_plan_names_map = {}
 
@@ -411,10 +418,8 @@ if "prev_class_filter" not in st.session_state:
 if "loaded" not in st.session_state:
     st.session_state.loaded = False
 
-# Bulk defaults (types only; classification is the active filter in this flow)
 if "bulk_default_types" not in st.session_state:
     st.session_state.bulk_default_types = []
-
 
 # -----------------------------
 # UI: Header + Notes
@@ -429,7 +434,6 @@ st.info(
     "📌 **Input CSV requirements:**\n"
     f"- Must contain: **{', '.join(INPUT_REQUIRED_COLS)}**\n"
 )
-
 
 # -----------------------------
 # Uploads
@@ -540,7 +544,7 @@ if st.session_state.loaded:
     carrier_to_types = universe["carrier_to_types"]
 
     # ---------------------------
-    # SIDEBAR: Filters + search + keywords
+    # SIDEBAR: Filters + search + preserve UI
     # ---------------------------
     with st.sidebar:
         st.header("Filters & Search")
@@ -572,6 +576,15 @@ if st.session_state.loaded:
         plan_name_keywords = parse_keywords(kw_text)
 
         enable_plan_name_filter = True
+
+        st.divider()
+        st.caption("Preserve specific plan names (these will NOT be removed)")
+        st.write("Enter plan names (comma or newline separated). You can choose to apply this to Medicaid only or all classifications.")
+        preserve_text = st.text_area("Preserve plan names", value="Colorado access, Rae 3, Rae2, Rae4, Rae 5, Community Alli, Rocky Mountain, Denver Health plan", height=100)
+        preserve_names = {p for p in parse_keywords(preserve_text)}
+        # Scope selector: apply to all classifications or only one
+        preserve_scope_options = ["(All)"] + st.session_state.all_classifications
+        preserve_scope = st.selectbox("Preserve scope", options=preserve_scope_options, index=1 if "Medicaid" in st.session_state.all_classifications else 0, help="Apply preserved names to all classifications or only a specific classification.")
 
         st.divider()
         miss = st.session_state.missing_plan_ids_count
@@ -640,7 +653,6 @@ if st.session_state.loaded:
         with colB:
             clear_all = st.button("Clear all")
         with colC:
-            # counts
             selected_total = len(st.session_state.selected_pairs)
             selected_in_cls = (
                 len([1 for (c, cls) in st.session_state.selected_pairs if cls == active_cls])
@@ -658,24 +670,19 @@ if st.session_state.loaded:
             st.session_state.carrier_widget_value = []
 
         if select_all_shown and active_cls is not None:
-            # Add (carrier, active_cls) for all shown carriers
             for carrier in displayed_carriers:
                 pair = (carrier, active_cls)
                 st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())       # empty => ALL
-                st.session_state.pair_plan_names_map.setdefault(pair, set())  # empty => ALL
-
-            # show them as selected in widget (for this class)
+                st.session_state.pair_types_map.setdefault(pair, set())
+                st.session_state.pair_plan_names_map.setdefault(pair, set())
             st.session_state.carrier_widget_value = sorted(list(set(displayed_carriers)), key=lambda x: x.lower())
 
-        # multiselect should represent ONLY the current classification selections
+        # multiselect shows current classification selections (but blank after changing class unless populated)
         if active_cls is not None:
             currently_selected_carriers_for_cls = sorted(
                 [c for (c, cls) in st.session_state.selected_pairs if cls == active_cls],
                 key=lambda x: x.lower(),
             )
-            # if widget empty but we have selections for this class, keep it empty per your requirement (blank on class change)
-            # but if user clicks select all, it will populate carrier_widget_value explicitly.
 
             selected_now = st.multiselect(
                 "Select carriers",
@@ -687,7 +694,6 @@ if st.session_state.loaded:
             prev_for_cls = set(currently_selected_carriers_for_cls)
             picked = set(selected_now)
 
-            # Remove pairs for this classification that are no longer picked
             to_remove = {(c, active_cls) for c in (prev_for_cls - picked)}
             if to_remove:
                 st.session_state.selected_pairs -= to_remove
@@ -695,7 +701,6 @@ if st.session_state.loaded:
                     st.session_state.pair_types_map.pop(pair, None)
                     st.session_state.pair_plan_names_map.pop(pair, None)
 
-            # Add new pairs for this classification
             to_add = {(c, active_cls) for c in (picked - prev_for_cls)}
             if to_add:
                 st.session_state.selected_pairs |= to_add
@@ -707,7 +712,8 @@ if st.session_state.loaded:
         st.caption(
             "- Plan Classification drives the carrier list.\n"
             "- Selections are stored as (Carrier, Classification) pairs.\n"
-            "- Summary shows everything across all classifications (duplicates allowed)."
+            "- Summary shows everything across all classifications (duplicates allowed).\n"
+            "- Use the Preserve box to keep certain plan names (e.g., in-network Medicaid plans) from being removed."
         )
 
     # ---------------------------
@@ -885,6 +891,8 @@ if st.session_state.loaded:
                         pair_plan_names_map=dict(st.session_state.pair_plan_names_map),
                         enable_plan_name_filter=enable_plan_name_filter,
                         plan_name_keywords=list(plan_name_keywords),
+                        preserve_plan_names=preserve_names,
+                        preserve_scope=preserve_scope,
                     )
 
                 preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in tabs_preview.items()]
@@ -910,6 +918,8 @@ if st.session_state.loaded:
                         pair_plan_names_map=dict(st.session_state.pair_plan_names_map),
                         enable_plan_name_filter=enable_plan_name_filter,
                         plan_name_keywords=list(plan_name_keywords),
+                        preserve_plan_names=preserve_names,
+                        preserve_scope=preserve_scope,
                     )
 
                 total_rows = sum(len(df) for df in tabs_final.values())
