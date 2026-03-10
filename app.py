@@ -1,5 +1,6 @@
 import io
 import re
+import hashlib
 import pandas as pd
 import streamlit as st
 
@@ -83,6 +84,24 @@ def parse_keywords(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def read_deprecated_plan_ids(dep_df: pd.DataFrame) -> set[str]:
+    col = None
+    for c in DEPRECATED_ACCEPTABLE_PLAN_ID_COLS:
+        if c in dep_df.columns:
+            col = c
+            break
+    if col is None:
+        raise ValueError(
+            f"Deprecated file must have a Plan_ID column (one of {DEPRECATED_ACCEPTABLE_PLAN_ID_COLS})."
+        )
+
+    dep_ids = set()
+    for v in dep_df[col].astype(str).fillna("").tolist():
+        for pid in split_csv_ids(v):
+            dep_ids.add(pid)
+    return dep_ids
+
+
 def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
     carrier_to_classifications = {}
     carrier_to_types = {}
@@ -130,24 +149,6 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
     }
 
 
-def read_deprecated_plan_ids(dep_df: pd.DataFrame) -> set[str]:
-    col = None
-    for c in DEPRECATED_ACCEPTABLE_PLAN_ID_COLS:
-        if c in dep_df.columns:
-            col = c
-            break
-    if col is None:
-        raise ValueError(
-            f"Deprecated file must have a Plan_ID column (one of {DEPRECATED_ACCEPTABLE_PLAN_ID_COLS})."
-        )
-
-    dep_ids = set()
-    for v in dep_df[col].astype(str).fillna("").tolist():
-        for pid in split_csv_ids(v):
-            dep_ids.add(pid)
-    return dep_ids
-
-
 # -----------------------------
 # Performance helpers
 # -----------------------------
@@ -161,27 +162,36 @@ def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
-# Classification-level plan-name rule logic
+# Rule logic: per (classification, carrier) OR wildcard carrier "*"
+# Modes:
+#   - ALL        : no rule (remove all)
+#   - ONLY       : remove ONLY selected names/keywords
+#   - ALL_EXCEPT : remove EVERYTHING EXCEPT selected names/keywords (preserve list)
 # -----------------------------
-def _rule_matches(pname: str, names: set[str], keywords: list[str]) -> bool:
-    if pname in names:
-        return True
-    pname_l = (pname or "").lower()
-    for kw in keywords:
-        if kw and kw.lower() in pname_l:
-            return True
-    return False
+def _mk_rule_key(cls: str, carrier: str) -> tuple[str, str]:
+    return (cls, carrier)
+
+
+def _rule_match_series(plan_name_series: pd.Series, names: set[str], keywords: list[str]) -> pd.Series:
+    name_match = plan_name_series.isin(names) if names else pd.Series(False, index=plan_name_series.index)
+    if keywords:
+        pat = "|".join(re.escape(k) for k in keywords if k)
+        if pat:
+            kw_match = plan_name_series.str.contains(pat, case=False, na=False, regex=True)
+        else:
+            kw_match = pd.Series(False, index=plan_name_series.index)
+    else:
+        kw_match = pd.Series(False, index=plan_name_series.index)
+
+    return name_match | kw_match
 
 
 def compute_removals_fast(
     input_long: pd.DataFrame,
     db_small: pd.DataFrame,
     selected_pairs: set[tuple[str, str]],
-    pair_types_map: dict[tuple[str, str], set[str] | None],          # pair -> types; empty=set() => ALL; None => NO MATCH
-    pair_plan_names_map: dict[tuple[str, str], set[str]],            # pair -> names; empty=set() => ALL (kept)
-    enable_pair_plan_name_filter: bool,
-    pair_plan_name_keywords: list[str],
-    class_plan_rule_active: dict[str, dict],                         # classification -> active rule
+    pair_types_map: dict[tuple[str, str], set[str] | None],   # empty=set() => ALL; None => NO MATCH
+    active_plan_rules: dict[tuple[str, str], dict],          # (cls, carrier or "*") -> {"mode","names","keywords"}
 ) -> dict[str, pd.DataFrame]:
     if not selected_pairs:
         return {}
@@ -213,11 +223,29 @@ def compute_removals_fast(
     if df.empty:
         return {}
 
-    # Apply ACTIVE classification plan-name rules (ONLY / ALL_EXCEPT)
-    if class_plan_rule_active:
+    # Apply plan rules (specific carrier overrides wildcard)
+    if active_plan_rules:
+        # Determine which rule applies for each row
+        def choose_rule_key(row):
+            cls = row["Plan Classification"]
+            car = row["Carrier_Name"]
+            k_specific = (cls, car)
+            k_wild = (cls, "*")
+            if k_specific in active_plan_rules:
+                return k_specific
+            if k_wild in active_plan_rules:
+                return k_wild
+            return None
+
+        # This is a bit of Python work but OK for typical file sizes
+        rule_keys = [choose_rule_key(r) for _, r in df[["Plan Classification", "Carrier_Name"]].iterrows()]
+        df["_rule_key"] = rule_keys
+
         keep_mask = pd.Series(True, index=df.index)
 
-        for pcl, rule in class_plan_rule_active.items():
+        # Apply each rule to its subset
+        for rk in sorted({k for k in df["_rule_key"].unique() if k is not None}):
+            rule = active_plan_rules.get(rk)
             if not rule:
                 continue
             mode = rule.get("mode", "ALL")
@@ -225,21 +253,14 @@ def compute_removals_fast(
                 continue
 
             names = set(rule.get("names", set()) or set())
-            kws = [k for k in (rule.get("keywords", []) or []) if k]
+            kws = list(rule.get("keywords", []) or [])
 
-            sub_idx = df.index[df["Plan Classification"] == pcl]
+            sub_idx = df.index[df["_rule_key"] == rk]
             if len(sub_idx) == 0:
                 continue
 
             sub = df.loc[sub_idx]
-            name_match = sub["Plan_Name"].isin(names) if names else pd.Series(False, index=sub.index)
-            if kws:
-                pat = "|".join(re.escape(k) for k in kws)
-                kw_match = sub["Plan_Name"].str.contains(pat, case=False, na=False, regex=True)
-            else:
-                kw_match = pd.Series(False, index=sub.index)
-
-            m = name_match | kw_match
+            m = _rule_match_series(sub["Plan_Name"], names, kws)
 
             if mode == "ONLY":
                 keep_mask.loc[sub_idx] = m.values
@@ -247,6 +268,7 @@ def compute_removals_fast(
                 keep_mask.loc[sub_idx] = (~m).values
 
         df = df[keep_mask].copy()
+        df = df.drop(columns=["_rule_key"])
         if df.empty:
             return {}
 
@@ -259,7 +281,7 @@ def compute_removals_fast(
         if df.empty:
             return {}
 
-    # Types restrictions per pair
+    # Plan type restrictions per pair
     restricted_types = {k: v for k, v in pair_types_map.items() if isinstance(v, set) and len(v) > 0}
     if restricted_types:
         allow_rows = []
@@ -278,54 +300,7 @@ def compute_removals_fast(
         if df.empty:
             return {}
 
-    # Existing per-pair plan-name filter (kept)
-    do_pair_name_filter = False
-    if enable_pair_plan_name_filter:
-        any_explicit = any(isinstance(v, set) and len(v) > 0 for v in pair_plan_names_map.values())
-        any_kw = len([k for k in pair_plan_name_keywords if k]) > 0
-        do_pair_name_filter = any_explicit or any_kw
-
-    if do_pair_name_filter:
-        if pair_plan_name_keywords:
-            kws = [k for k in pair_plan_name_keywords if k]
-            if kws:
-                pat = "|".join(re.escape(k) for k in kws)
-                kw_mask = df["Plan_Name"].str.contains(pat, case=False, na=False, regex=True)
-            else:
-                kw_mask = pd.Series(False, index=df.index)
-        else:
-            kw_mask = pd.Series(False, index=df.index)
-
-        restricted_names = {k: v for k, v in pair_plan_names_map.items() if isinstance(v, set) and len(v) > 0}
-        name_mask = pd.Series(False, index=df.index)
-
-        if restricted_names:
-            allow_rows = []
-            for (carrier, cls), nameset in restricted_names.items():
-                for n in nameset:
-                    allow_rows.append((carrier, cls, n))
-            allow_names_df = pd.DataFrame(allow_rows, columns=["Carrier_Name", "Plan Classification", "Plan_Name"])
-
-            tmp = df[["Carrier_Name", "Plan Classification", "Plan_Name"]].copy()
-            tmp["_idx"] = tmp.index
-            matched = tmp.merge(allow_names_df, on=["Carrier_Name", "Plan Classification", "Plan_Name"], how="inner")
-            if not matched.empty:
-                name_mask.loc[matched["_idx"].values] = True
-
-        pairs_all_names = {k for k, v in pair_plan_names_map.items() if isinstance(v, set) and len(v) == 0}
-        restricted_pairs = set(restricted_names.keys()) if restricted_names else set()
-
-        pair_key_series = list(zip(df["Carrier_Name"], df["Plan Classification"]))
-        pair_all_mask = pd.Series(
-            [(pk in pairs_all_names) or (pk not in restricted_pairs) for pk in pair_key_series],
-            index=df.index,
-        )
-
-        keep = (kw_mask | name_mask) if pair_plan_name_keywords else (pair_all_mask | name_mask)
-        df = df[keep].copy()
-        if df.empty:
-            return {}
-
+    # Output tabs
     out_df = df[["MappingLevel", "ProviderId", "LocationId", "PlanId"]].drop_duplicates(
         subset=["MappingLevel", "ProviderId", "LocationId", "PlanId"]
     )
@@ -347,6 +322,11 @@ def make_excel_bytes(tabs: dict[str, pd.DataFrame]) -> bytes:
     return bio.getvalue()
 
 
+def stable_key(*parts: str) -> str:
+    raw = "||".join([p or "" for p in parts])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 # -----------------------------
 # Session state init
 # -----------------------------
@@ -354,17 +334,13 @@ if "selected_pairs" not in st.session_state:
     st.session_state.selected_pairs = set()  # {(carrier, classification)}
 
 if "pair_types_map" not in st.session_state:
-    st.session_state.pair_types_map = {}
+    st.session_state.pair_types_map = {}     # (carrier, cls) -> set(types) or None
 
-if "pair_plan_names_map" not in st.session_state:
-    st.session_state.pair_plan_names_map = {}
+if "active_plan_rules" not in st.session_state:
+    st.session_state.active_plan_rules = {}  # (cls, carrier or "*") -> {"mode","names","keywords"}
 
-# ACTIVE rules only apply after user clicks Apply/Confirm
-if "class_plan_rule_active" not in st.session_state:
-    st.session_state.class_plan_rule_active = {}
-
-if "carrier_widget_value" not in st.session_state:
-    st.session_state.carrier_widget_value = []
+if "loaded" not in st.session_state:
+    st.session_state.loaded = False
 
 if "active_global_class_filter" not in st.session_state:
     st.session_state.active_global_class_filter = None
@@ -372,19 +348,23 @@ if "active_global_class_filter" not in st.session_state:
 if "prev_class_filter" not in st.session_state:
     st.session_state.prev_class_filter = None
 
-if "loaded" not in st.session_state:
-    st.session_state.loaded = False
+if "carrier_add_picker" not in st.session_state:
+    st.session_state.carrier_add_picker = []  # widget key safe
+
+if "plan_explorer_selected" not in st.session_state:
+    # (cls, carrier) -> set(plan_names checked in explorer)
+    st.session_state.plan_explorer_selected = {}
+
+if "plan_explorer_last_results" not in st.session_state:
+    # cached results for current cls & keyword: list of (carrier, plan_name)
+    st.session_state.plan_explorer_last_results = []
 
 if "bulk_default_types" not in st.session_state:
     st.session_state.bulk_default_types = []
 
-# Finder cache for UI
-if "finder_results" not in st.session_state:
-    st.session_state.finder_results = []
-
 
 # -----------------------------
-# UI: Header + Notes
+# UI: Header
 # -----------------------------
 st.title("Removal Tool")
 
@@ -442,7 +422,6 @@ if load_btn:
 
             prog.progress(70, text="Analyzing carriers/classifications/types/plan names...")
             universe = analyze_universe(input_df, plan_lookup)
-
             missing_plan_ids = universe["missing_plan_ids"]
 
             deprecated_found = 0
@@ -461,37 +440,24 @@ if load_btn:
             ].copy()
 
             prog.progress(94, text="Preparing UI data...")
-            all_carriers = sorted(universe["carrier_to_classifications"].keys(), key=lambda x: x.lower())
-            all_classifications = sorted(universe["classification_to_carriers"].keys(), key=lambda x: x.lower())
-            all_types = sorted(universe["plan_types_universe"], key=lambda x: x.lower())
-
-            st.session_state.input_df = input_df
-            st.session_state.db_df = db_df
-            st.session_state.plan_lookup = plan_lookup
             st.session_state.universe = universe
-
-            st.session_state.all_carriers = all_carriers
-            st.session_state.all_classifications = all_classifications
-            st.session_state.all_types = all_types
-            st.session_state.classification_to_plan_names = universe["classification_to_plan_names"]
-
+            st.session_state.all_classifications = sorted(universe["classification_to_carriers"].keys(), key=lambda x: x.lower())
+            st.session_state.all_types = sorted(universe["plan_types_universe"], key=lambda x: x.lower())
             st.session_state.missing_plan_ids_count = len(missing_plan_ids)
             st.session_state.deprecated_found = deprecated_found
             st.session_state.deprecated_total = deprecated_total
 
-            st.session_state.active_global_class_filter = None
-            st.session_state.prev_class_filter = None
-
-            # reset selections
+            # Reset state on load
             st.session_state.selected_pairs = set()
             st.session_state.pair_types_map = {}
-            st.session_state.pair_plan_names_map = {}
-            st.session_state.class_plan_rule_active = {}
-            st.session_state.carrier_widget_value = []
-            st.session_state.finder_results = []
+            st.session_state.active_plan_rules = {}
+            st.session_state.active_global_class_filter = None
+            st.session_state.prev_class_filter = None
+            st.session_state.carrier_add_picker = []
+            st.session_state.plan_explorer_selected = {}
+            st.session_state.plan_explorer_last_results = []
 
             st.session_state.loaded = True
-
             prog.progress(100, text="Done.")
             st.success("Loaded and analyzed successfully.")
         except Exception as e:
@@ -504,38 +470,32 @@ if load_btn:
 # -----------------------------
 if st.session_state.loaded:
     universe = st.session_state.universe
-    carrier_to_plan_names = universe["carrier_to_plan_names"]
     classification_to_carriers = universe["classification_to_carriers"]
+    carrier_to_plan_names = universe["carrier_to_plan_names"]
     carrier_to_types = universe["carrier_to_types"]
 
     # ---------------------------
-    # SIDEBAR: classification + view search
+    # Sidebar: classification + view-only search
     # ---------------------------
     with st.sidebar:
-        st.header("Filters & Search")
+        st.header("Pick a Classification")
 
-        st.caption("Plan Classification (required for carrier picking)")
         class_filter = st.selectbox(
             "Plan Classification",
             options=["(select)"] + st.session_state.all_classifications,
             index=0,
             format_func=lambda x: "Select a classification" if x == "(select)" else x,
+            key="sidebar_class_filter",
         )
 
         st.divider()
-        st.caption("🔎 View-only search (does NOT change your selection)")
-        st.write("This only changes what you SEE on the left. It will never remove existing summary selections.")
-        carrier_search = st.text_input(
+        st.caption("🔎 View-only search (never removes selection)")
+        view_search = st.text_input(
             "Search carriers OR plan names",
             value="",
-            placeholder="Example: cigna OR rae OR medicaid",
+            placeholder="Example: aetna OR rae OR rocky",
+            key="sidebar_view_search",
         )
-
-        st.divider()
-        st.caption("Row-level plan-name keywords (optional, applies during removal)")
-        kw_text = st.text_area("Keywords (comma/newline)", value="", height=80)
-        pair_plan_name_keywords = parse_keywords(kw_text)
-        enable_pair_plan_name_filter = True
 
         st.divider()
         miss = st.session_state.missing_plan_ids_count
@@ -545,23 +505,25 @@ if st.session_state.loaded:
         else:
             st.info(f"Missing in DB: {miss} (upload deprecated file to match)")
 
-    # Reset left carrier picker when class changes (blank picker), but DO NOT touch selections
-    if class_filter != st.session_state.prev_class_filter:
-        st.session_state.carrier_widget_value = []
-        st.session_state.finder_results = []
-        st.session_state.prev_class_filter = class_filter
-
-    # displayed carriers from chosen classification only
+    # update active filter
     if class_filter != "(select)":
         st.session_state.active_global_class_filter = class_filter
-        carriers_base = sorted(list(classification_to_carriers.get(class_filter, set())), key=lambda x: x.lower())
     else:
         st.session_state.active_global_class_filter = None
-        carriers_base = []
 
-    # View-only search: filter visible list, never changes selection
-    if carriers_base and carrier_search.strip():
-        q = carrier_search.strip().lower()
+    # when class changes, clear view pickers but KEEP summary selections
+    if class_filter != st.session_state.prev_class_filter:
+        st.session_state.carrier_add_picker = []
+        st.session_state.plan_explorer_last_results = []
+        st.session_state.prev_class_filter = class_filter
+
+    active_cls = st.session_state.active_global_class_filter
+    disabled_pick = active_cls is None
+
+    # compute displayed carriers for this classification (view-only search)
+    carriers_base = sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower()) if active_cls else []
+    if active_cls and view_search.strip():
+        q = view_search.strip().lower()
         filtered = []
         for c in carriers_base:
             if q in c.lower():
@@ -578,133 +540,243 @@ if st.session_state.loaded:
     left, right = st.columns([2, 1], gap="large")
 
     # ---------------------------
-    # LEFT: Carrier selection (ADD-only; never auto-removes)
+    # LEFT: Carrier selection (ADD-only; safe)
     # ---------------------------
     with left:
         st.markdown("### 1) Pick Carriers")
 
-        active_cls = st.session_state.active_global_class_filter
-        disabled_pick = active_cls is None
-
         if disabled_pick:
-            st.info("Select a Plan Classification in the left sidebar to load carriers.")
+            st.info("Select a Plan Classification in the sidebar to load carriers.")
         else:
-            glimpse_n = min(5, len(displayed_carriers))
-            if glimpse_n > 0:
-                st.caption("Glimpse: " + " • ".join(displayed_carriers[:glimpse_n]))
-            else:
-                st.caption("No carriers found for this classification (after search filter).")
+            glimpse = displayed_carriers[:5]
+            st.caption("Glimpse: " + (" • ".join(glimpse) if glimpse else "(none)"))
+
+        def add_all_shown():
+            if not st.session_state.active_global_class_filter:
+                return
+            cls = st.session_state.active_global_class_filter
+            shown = st.session_state.get("displayed_carriers_cache", [])
+            for carrier in shown:
+                pair = (carrier, cls)
+                st.session_state.selected_pairs.add(pair)
+                st.session_state.pair_types_map.setdefault(pair, set())
+
+        def add_selected_carriers():
+            cls = st.session_state.active_global_class_filter
+            picked = st.session_state.get("carrier_add_picker", [])
+            if not cls or not picked:
+                return
+            for carrier in picked:
+                pair = (carrier, cls)
+                st.session_state.selected_pairs.add(pair)
+                st.session_state.pair_types_map.setdefault(pair, set())
+            st.session_state["carrier_add_picker"] = []
+
+        def clear_all():
+            st.session_state.selected_pairs = set()
+            st.session_state.pair_types_map = {}
+            st.session_state.carrier_add_picker = []
+
+        st.session_state["displayed_carriers_cache"] = list(displayed_carriers)
 
         colA, colB, colC = st.columns([1, 1, 2])
         with colA:
-            add_all_shown = st.button("Select all shown", disabled=disabled_pick)
+            st.button("Select all shown", disabled=disabled_pick, on_click=add_all_shown)
         with colB:
-            clear_all = st.button("Clear all")
+            st.button("Clear ALL selections", on_click=clear_all)
         with colC:
             selected_total = len(st.session_state.selected_pairs)
-            selected_in_cls = (
-                len([1 for (_, cls) in st.session_state.selected_pairs if cls == active_cls])
-                if active_cls is not None
-                else 0
-            )
-            st.caption(
-                f"Shown: {len(displayed_carriers)} | Selected (this class): {selected_in_cls} | Selected (total): {selected_total}"
-            )
+            selected_in_cls = len([1 for (_, cls) in st.session_state.selected_pairs if cls == active_cls]) if active_cls else 0
+            st.caption(f"Shown: {len(displayed_carriers)} | Selected (this class): {selected_in_cls} | Selected (total): {selected_total}")
 
-        if clear_all:
-            st.session_state.selected_pairs = set()
-            st.session_state.pair_types_map = {}
-            st.session_state.pair_plan_names_map = {}
-            st.session_state.carrier_widget_value = []
-            st.session_state.finder_results = []
-
-        # ADDITIVE: Select all shown just adds pairs; never removes anything
-        if add_all_shown and active_cls is not None:
-            for carrier in displayed_carriers:
-                pair = (carrier, active_cls)
-                st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())       # empty => ALL
-                st.session_state.pair_plan_names_map.setdefault(pair, set()) # empty => ALL
-            st.success(f"Added {len(displayed_carriers)} carriers for {active_cls} (selection preserved).")
-
-        # Multiselect is now "pick some to add" (not source of truth)
-        picked_to_add = st.multiselect(
-            "Select carriers (then click Add selected)",
+        st.multiselect(
+            "Select carriers to add",
             options=displayed_carriers,
-            key="carrier_widget_value",
+            key="carrier_add_picker",
             label_visibility="collapsed",
             disabled=disabled_pick,
         )
-        if st.button("Add selected carriers", use_container_width=True, disabled=disabled_pick or (not picked_to_add)):
-            for carrier in picked_to_add:
-                pair = (carrier, active_cls)
-                st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())
-                st.session_state.pair_plan_names_map.setdefault(pair, set())
-            st.session_state.carrier_widget_value = []  # clear picker
-            st.success(f"Added {len(picked_to_add)} carriers for {active_cls} (selection preserved).")
+        st.button(
+            "Add selected carriers",
+            use_container_width=True,
+            disabled=disabled_pick,
+            on_click=add_selected_carriers,
+        )
 
-        # ---- Finder: plan-name keyword -> carriers (ADD results without touching existing) ----
         st.divider()
-        st.markdown("### Finder: carriers that have plan-name keyword (additive)")
-        st.caption("Use this to discover carriers. Adding results will never remove your existing selection.")
+        st.markdown("### 2) Plan Name Explorer (smart)")
+        st.caption(
+            "Type a plan keyword → see carriers + plan names → check what to remove/keep → Confirm.\n"
+            "This does NOT change your carrier selection."
+        )
 
-        finder_kw = st.text_input(
-            "Find carriers by plan-name keyword",
+        explorer_kw = st.text_input(
+            "Plan keyword",
             value="",
             placeholder="Example: rae OR rocky OR denver",
             disabled=disabled_pick,
-            key="finder_kw",
+            key="explorer_kw",
         )
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            run_finder = st.button("Find carriers", disabled=disabled_pick or not finder_kw.strip(), use_container_width=True)
-        with c2:
-            add_finder = st.button(
-                "Add finder results",
-                disabled=disabled_pick or (len(st.session_state.finder_results) == 0),
+        explorer_mode = st.radio(
+            "Checked plans mean:",
+            options=["ALLOW (keep these, remove everything else)", "REMOVE ONLY (remove these plans only)"],
+            index=0,
+            disabled=disabled_pick,
+            key="explorer_mode",
+        )
+
+        # Build explorer results from db_small
+        results = []
+        if (not disabled_pick) and explorer_kw.strip():
+            kw = explorer_kw.strip().lower()
+            dbs = st.session_state.db_small.copy()
+            dbs["Carrier_Name"] = dbs["Carrier_Name"].astype(str).map(normalize_str)
+            dbs["Plan Classification"] = dbs["Plan Classification"].astype(str).map(normalize_str)
+            dbs["Plan_Name"] = dbs["Plan_Name"].astype(str).map(normalize_str)
+
+            dbs = dbs[dbs["Plan Classification"] == active_cls].copy()
+            dbs = dbs[dbs["Plan_Name"].str.contains(re.escape(kw), case=False, na=False)].copy()
+
+            if not dbs.empty:
+                # distinct carrier-planname pairs
+                dbs = dbs[["Carrier_Name", "Plan_Name"]].drop_duplicates()
+                results = list(dbs.itertuples(index=False, name=None))
+
+        st.session_state.plan_explorer_last_results = results
+
+        # show results grouped by carrier
+        if disabled_pick:
+            st.info("Select a classification to use Plan Name Explorer.")
+        elif not explorer_kw.strip():
+            st.info("Enter a plan keyword to view carriers + plan names.")
+        elif not results:
+            st.warning("No matching plan names found for this keyword under this classification.")
+        else:
+            # Group
+            by_carrier = {}
+            for carrier, pname in results:
+                by_carrier.setdefault(carrier, []).append(pname)
+            carriers_found = sorted(by_carrier.keys(), key=lambda x: x.lower())
+
+            st.caption(f"Found **{sum(len(v) for v in by_carrier.values())}** matching plan names across **{len(carriers_found)}** carriers.")
+
+            # Bulk actions for visible results
+            def bulk_select_all_visible():
+                cls = st.session_state.active_global_class_filter
+                if not cls:
+                    return
+                for car in carriers_found:
+                    k = (cls, car)
+                    existing = st.session_state.plan_explorer_selected.get(k, set())
+                    st.session_state.plan_explorer_selected[k] = set(existing) | set(by_carrier.get(car, []))
+
+            def bulk_clear_all_visible():
+                cls = st.session_state.active_global_class_filter
+                if not cls:
+                    return
+                for car in carriers_found:
+                    k = (cls, car)
+                    st.session_state.plan_explorer_selected[k] = set()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.button("Select ALL shown plan names", use_container_width=True, on_click=bulk_select_all_visible)
+            with c2:
+                st.button("Clear ALL shown checks", use_container_width=True, on_click=bulk_clear_all_visible)
+
+            # Render carrier expanders with checkboxes
+            # To avoid too much scrolling, cap carriers shown
+            MAX_CARRIERS = 30
+            if len(carriers_found) > MAX_CARRIERS:
+                st.warning(f"Showing first {MAX_CARRIERS} carriers. Refine keyword to narrow results.")
+
+            carriers_to_render = carriers_found[:MAX_CARRIERS]
+
+            # We will compute new selections for rendered carriers and store them
+            for car in carriers_to_render:
+                plan_list = sorted(list(set(by_carrier.get(car, []))), key=lambda x: (x or "").lower())
+                key_bucket = (active_cls, car)
+                current_selected = set(st.session_state.plan_explorer_selected.get(key_bucket, set()) or set())
+
+                with st.expander(f"{car} ({len(plan_list)} matching plans)", expanded=False):
+                    new_selected = set(current_selected)
+
+                    for pname in plan_list:
+                        ck = f"ck__{stable_key(active_cls, car, pname)}"
+                        checked = st.checkbox(
+                            pname,
+                            value=(pname in current_selected),
+                            key=ck,
+                        )
+                        if checked:
+                            new_selected.add(pname)
+                        else:
+                            new_selected.discard(pname)
+
+                    st.session_state.plan_explorer_selected[key_bucket] = new_selected
+
+        # Confirm / Apply button
+        st.divider()
+
+        def apply_explorer_rule():
+            cls = st.session_state.active_global_class_filter
+            if not cls:
+                return
+
+            mode = st.session_state.get("explorer_mode", "ALLOW (keep these, remove everything else)")
+            # Apply per carrier based on checked selections
+            applied = 0
+            for (ccls, car), nameset in st.session_state.plan_explorer_selected.items():
+                if ccls != cls:
+                    continue
+                nameset = set(nameset or set())
+                if not nameset:
+                    continue
+
+                # Map mode to rule
+                if mode.startswith("ALLOW"):
+                    rule_mode = "ALL_EXCEPT"  # remove everything except allowed (preserve allow list)
+                else:
+                    rule_mode = "ONLY"        # remove only selected
+
+                st.session_state.active_plan_rules[(cls, car)] = {
+                    "mode": rule_mode,
+                    "names": set(nameset),
+                    "keywords": [],  # keyword selection already converted to explicit names
+                }
+                applied += 1
+
+        def clear_rules_for_this_class():
+            cls = st.session_state.active_global_class_filter
+            if not cls:
+                return
+            # remove any rule for this class (specific or wildcard)
+            to_del = [k for k in st.session_state.active_plan_rules.keys() if k[0] == cls]
+            for k in to_del:
+                st.session_state.active_plan_rules.pop(k, None)
+
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            st.button(
+                "✅ Confirm / Apply checked plan-name rules",
                 use_container_width=True,
+                disabled=disabled_pick,
+                on_click=apply_explorer_rule,
+            )
+        with cc2:
+            st.button(
+                "🧹 Clear ACTIVE plan-name rules for this classification",
+                use_container_width=True,
+                disabled=disabled_pick,
+                on_click=clear_rules_for_this_class,
             )
 
-        if run_finder and active_cls is not None:
-            kw = finder_kw.strip().lower()
-            results = []
-            # Search carriers in this classification for plan-name keyword
-            for c in sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower()):
-                pnames = carrier_to_plan_names.get(c, set())
-                if any(kw in (pn or "").lower() for pn in pnames):
-                    results.append(c)
-            st.session_state.finder_results = results
-            st.info(f"Finder results: {len(results)} carriers found for '{finder_kw}' under {active_cls}.")
-
-        if st.session_state.finder_results:
-            st.write("Found carriers:")
-            st.write(", ".join(st.session_state.finder_results[:30]) + (" ..." if len(st.session_state.finder_results) > 30 else ""))
-
-        if add_finder and active_cls is not None:
-            added = 0
-            for carrier in st.session_state.finder_results:
-                pair = (carrier, active_cls)
-                if pair not in st.session_state.selected_pairs:
-                    added += 1
-                st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())
-                st.session_state.pair_plan_names_map.setdefault(pair, set())
-            st.success(f"Added {added} new carriers from finder for {active_cls} (selection preserved).")
-
-        st.markdown("### Tips")
-        st.caption(
-            "- Search boxes only change what you SEE.\n"
-            "- Buttons ADD carriers; they never remove your existing selection.\n"
-            "- To remove something, use the right-side Summary controls."
-        )
-
     # ---------------------------
-    # RIGHT: Summary + apply/confirm plan-name rules + preview/generate
+    # RIGHT: Summary + Active Rules + Preview + Generate
     # ---------------------------
     with right:
-        st.markdown("### Summary")
+        st.markdown("### Summary (what will be processed)")
 
         selected_pairs_sorted = sorted(list(st.session_state.selected_pairs), key=lambda x: (x[0].lower(), x[1].lower()))
         if not selected_pairs_sorted:
@@ -712,51 +784,56 @@ if st.session_state.loaded:
         else:
             # Summary table
             rows = []
-            for pair in selected_pairs_sorted:
-                carrier, cls = pair
-                types_val = st.session_state.pair_types_map.get(pair, set())
-
+            for (carrier, cls) in selected_pairs_sorted:
+                types_val = st.session_state.pair_types_map.get((carrier, cls), set())
                 if types_val is None:
-                    types_label = "NO MATCH (0 rows)"
+                    types_label = "NO MATCH"
                 elif not types_val:
                     types_label = "ALL"
                 else:
                     types_label = f"{len(types_val)} selected"
-
-                rows.append(
-                    {
-                        "Carrier": carrier,
-                        "Plan Classification": cls,
-                        "Plan Types": types_label,
-                    }
-                )
+                rows.append({"Carrier": carrier, "Plan Classification": cls, "Plan Types": types_label})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-            # Remove selected rows explicitly (safe removal)
+            # Active rules view
+            st.divider()
+            st.markdown("### ACTIVE Plan-Name Rules")
+
+            if not st.session_state.active_plan_rules:
+                st.caption("No active plan-name rules. (Default = remove all plans under selected carriers/classifications).")
+            else:
+                # show rules grouped by classification
+                rule_rows = []
+                for (cls, car), rule in sorted(st.session_state.active_plan_rules.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
+                    rule_rows.append({
+                        "Classification": cls,
+                        "Carrier": car,
+                        "Mode": rule.get("mode"),
+                        "Plan names count": len(rule.get("names", set()) or set()),
+                        "Keywords count": len(rule.get("keywords", []) or []),
+                    })
+                st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
+
+            # Remove explicitly (never accidental)
             st.divider()
             st.markdown("### Remove selected rows (explicit)")
-            to_remove_labels = [f"{c} | {cls}" for (c, cls) in selected_pairs_sorted]
-            pick_remove = st.multiselect(
-                "Choose rows to remove from summary",
-                options=to_remove_labels,
-                default=[],
-                key="rows_to_remove",
-            )
-            if st.button("Remove chosen rows", use_container_width=True, disabled=not pick_remove):
+
+            labels = [f"{c} | {cls}" for (c, cls) in selected_pairs_sorted]
+            remove_pick = st.multiselect("Choose rows to remove", options=labels, default=[], key="remove_pick")
+            if st.button("Remove chosen rows", use_container_width=True, disabled=not remove_pick):
                 remove_set = set()
-                for lab in pick_remove:
+                for lab in remove_pick:
                     c, cls = [p.strip() for p in lab.split("|", 1)]
                     remove_set.add((c, cls))
 
                 st.session_state.selected_pairs -= remove_set
                 for pair in remove_set:
                     st.session_state.pair_types_map.pop(pair, None)
-                    st.session_state.pair_plan_names_map.pop(pair, None)
 
-                st.success(f"Removed {len(remove_set)} rows from summary.")
-                st.session_state.rows_to_remove = []
+                st.success(f"Removed {len(remove_set)} rows.")
+                st.session_state.remove_pick = []
 
-            # Bulk types apply
+            # Bulk plan types (optional)
             st.divider()
             with st.expander("Bulk apply plan types to ALL selected rows", expanded=False):
                 bulk_types = st.multiselect(
@@ -766,148 +843,34 @@ if st.session_state.loaded:
                     key="bulk_default_types",
                 )
 
-                if st.button("Apply these Plan Types to ALL selected rows", use_container_width=True):
-                    requested = set(bulk_types)
-                    no_match_pairs = []
-
-                    for (carrier, cls) in selected_pairs_sorted:
+                def apply_bulk_types():
+                    requested = set(st.session_state.get("bulk_default_types", []))
+                    no_match = 0
+                    for (carrier, cls) in st.session_state.selected_pairs:
                         allowed = carrier_to_types.get(carrier, set())
                         valid = requested.intersection(allowed)
-
                         if requested and not valid:
                             st.session_state.pair_types_map[(carrier, cls)] = None
-                            no_match_pairs.append((carrier, cls))
+                            no_match += 1
                         else:
                             st.session_state.pair_types_map[(carrier, cls)] = set(valid)
-
-                    if no_match_pairs:
-                        st.warning(
-                            f"{len(no_match_pairs)} rows had **no matching plan types** for your bulk selection "
-                            f"(marked as **NO MATCH**; they will remove 0 rows unless edited)."
-                        )
+                    if no_match:
+                        st.warning(f"{no_match} rows marked NO MATCH for your type selection.")
                     else:
-                        st.success("Applied plan types to all selected rows.")
+                        st.success("Applied plan types.")
 
-            # ---- Classification plan-name rules with Apply/Confirm ----
-            st.divider()
-            st.markdown("### Plan name rules (by classification)")
+                st.button("Apply plan types", use_container_width=True, on_click=apply_bulk_types)
 
-            active_cls = st.session_state.active_global_class_filter
-            if active_cls is None:
-                st.info("Select a Plan Classification on the left to configure plan-name rules for it.")
-            else:
-                active_rule = st.session_state.class_plan_rule_active.get(active_cls, {"mode": "ALL", "names": set(), "keywords": []})
-
-                # Show active rule banner
-                if active_rule.get("mode", "ALL") == "ALL":
-                    st.caption(f"Active rule for **{active_cls}**: None (remove all plans).")
-                elif active_rule.get("mode") == "ONLY":
-                    st.success(
-                        f"Active rule for **{active_cls}**: Remove ONLY selected plan names/keywords "
-                        f"({len(active_rule.get('names', set()) or set())} names, {len(active_rule.get('keywords', []) or [])} keywords)."
-                    )
-                elif active_rule.get("mode") == "ALL_EXCEPT":
-                    st.success(
-                        f"Active rule for **{active_cls}**: Remove ALL EXCEPT selected plan names/keywords "
-                        f"({len(active_rule.get('names', set()) or set())} names, {len(active_rule.get('keywords', []) or [])} keywords)."
-                    )
-
-                # Draft UI (does not apply until you click Apply)
-                st.caption("Draft changes below will NOT take effect until you click **Apply / Confirm**.")
-
-                draft_mode = st.radio(
-                    f"Draft mode for {active_cls}",
-                    options=["ALL", "ONLY", "ALL_EXCEPT"],
-                    index={"ALL": 0, "ONLY": 1, "ALL_EXCEPT": 2}.get(active_rule.get("mode", "ALL"), 0),
-                    format_func=lambda x: {
-                        "ALL": "Remove all plans (no plan-name rule)",
-                        "ONLY": "Remove ONLY selected plan names / keywords",
-                        "ALL_EXCEPT": "Remove ALL EXCEPT selected plan names / keywords (preserve list)",
-                    }[x],
-                    key=f"draft_mode__{active_cls}",
-                )
-
-                all_names = sorted(
-                    list(st.session_state.classification_to_plan_names.get(active_cls, set())),
-                    key=lambda x: (x or "").lower(),
-                )
-                q = st.text_input("Search plan names", value="", key=f"draft_plan_search__{active_cls}")
-                visible = [n for n in all_names if q.strip().lower() in (n or "").lower()] if q.strip() else all_names
-
-                # draft selected names default from ACTIVE
-                active_names = set(active_rule.get("names", set()) or set())
-                default_visible = sorted(list(active_names.intersection(set(visible))), key=lambda x: (x or "").lower())
-
-                c1, c2, c3 = st.columns([1, 1, 1])
-                with c1:
-                    if st.button("Draft: select all shown", key=f"draft_selall__{active_cls}", use_container_width=True):
-                        # store in session as helper
-                        st.session_state[f"draft_names_cache__{active_cls}"] = list(set(visible) | active_names)
-                with c2:
-                    if st.button("Draft: clear", key=f"draft_clear__{active_cls}", use_container_width=True):
-                        st.session_state[f"draft_names_cache__{active_cls}"] = []
-                with c3:
-                    clear_rule = st.button("Clear ACTIVE rule", key=f"clear_active_rule__{active_cls}", use_container_width=True)
-
-                cache_key = f"draft_names_cache__{active_cls}"
-                if cache_key not in st.session_state:
-                    st.session_state[cache_key] = list(active_names)
-
-                # if user used buttons, those values are the defaults
-                cached = st.session_state[cache_key]
-                cached_visible = sorted(list(set(cached).intersection(set(visible))), key=lambda x: (x or "").lower())
-
-                draft_names = st.multiselect(
-                    "Draft selected plan names",
-                    options=visible,
-                    default=cached_visible if cached_visible else default_visible,
-                    key=f"draft_names__{active_cls}",
-                )
-
-                # keep hidden draft names across searches
-                keep_hidden = set(st.session_state[cache_key]) - set(visible)
-                final_draft_names = keep_hidden | set(draft_names)
-                st.session_state[cache_key] = list(final_draft_names)
-
-                draft_kw_text = st.text_area(
-                    "Draft keywords (comma/newline)",
-                    value="\n".join(active_rule.get("keywords", []) or []),
-                    height=70,
-                    key=f"draft_keywords__{active_cls}",
-                )
-                draft_keywords = parse_keywords(draft_kw_text)
-
-                col_apply1, col_apply2 = st.columns(2)
-                with col_apply1:
-                    apply_rule = st.button("Apply / Confirm draft rule", use_container_width=True, key=f"apply_rule__{active_cls}")
-                with col_apply2:
-                    noop = st.button("Do nothing", use_container_width=True, key=f"noop__{active_cls}")
-
-                if clear_rule:
-                    st.session_state.class_plan_rule_active.pop(active_cls, None)
-                    st.success(f"Cleared ACTIVE rule for {active_cls} (back to remove all).")
-
-                if apply_rule:
-                    st.session_state.class_plan_rule_active[active_cls] = {
-                        "mode": draft_mode,
-                        "names": set(final_draft_names),
-                        "keywords": list(draft_keywords),
-                    }
-                    st.success(f"Applied ACTIVE rule for {active_cls}.")
-
-            # ---- Preview counts (FAST) ----
+            # Preview / Generate
             st.divider()
             if st.button("Preview removal counts", use_container_width=True):
-                with st.spinner("Building preview (optimized)..."):
+                with st.spinner("Building preview..."):
                     tabs_preview = compute_removals_fast(
                         input_long=st.session_state.input_long,
                         db_small=st.session_state.db_small,
                         selected_pairs=set(st.session_state.selected_pairs),
                         pair_types_map=dict(st.session_state.pair_types_map),
-                        pair_plan_names_map=dict(st.session_state.pair_plan_names_map),
-                        enable_pair_plan_name_filter=enable_pair_plan_name_filter,
-                        pair_plan_name_keywords=list(pair_plan_name_keywords),
-                        class_plan_rule_active=dict(st.session_state.class_plan_rule_active),
+                        active_plan_rules=dict(st.session_state.active_plan_rules),
                     )
 
                 preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in tabs_preview.items()]
@@ -920,20 +883,16 @@ if st.session_state.loaded:
                 st.success(f"Preview ready. Total rows: {total_preview}")
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-            # ---- Final output (FAST) ----
             st.divider()
             generate = st.button("FINAL: Generate Removal Output", type="primary", use_container_width=True)
             if generate:
-                with st.spinner("Computing removals (optimized)..."):
+                with st.spinner("Computing removals..."):
                     tabs_final = compute_removals_fast(
                         input_long=st.session_state.input_long,
                         db_small=st.session_state.db_small,
                         selected_pairs=set(st.session_state.selected_pairs),
                         pair_types_map=dict(st.session_state.pair_types_map),
-                        pair_plan_names_map=dict(st.session_state.pair_plan_names_map),
-                        enable_pair_plan_name_filter=enable_pair_plan_name_filter,
-                        pair_plan_name_keywords=list(pair_plan_name_keywords),
-                        class_plan_rule_active=dict(st.session_state.class_plan_rule_active),
+                        active_plan_rules=dict(st.session_state.active_plan_rules),
                     )
 
                 total_rows = sum(len(df) for df in tabs_final.values())
