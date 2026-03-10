@@ -289,6 +289,28 @@ def make_excel_bytes(tabs: dict[str, pd.DataFrame]) -> bytes:
     return bio.getvalue()
 
 
+def group_plans_comma(tabs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """
+    Convert each MappingLevel tab from:
+      ProviderId | LocationId | PlanId (one per row)
+    to:
+      ProviderId | LocationId | PlanIds (comma-separated)
+    """
+    out = {}
+    for lvl, df in tabs.items():
+        if df is None or df.empty:
+            out[lvl] = pd.DataFrame(columns=["ProviderId", "LocationId", "PlanIds"])
+            continue
+
+        g = (
+            df.groupby(["ProviderId", "LocationId"], as_index=False)["PlanId"]
+              .apply(lambda s: ",".join(sorted(set([str(x).strip() for x in s if str(x).strip()]))))
+        )
+        g = g.rename(columns={"PlanId": "PlanIds"})
+        out[lvl] = g
+    return out
+
+
 def stable_key(*parts: str) -> str:
     raw = "||".join([p or "" for p in parts])
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -329,11 +351,9 @@ if "carrier_add_picker" not in st.session_state:
 if "bulk_default_types" not in st.session_state:
     st.session_state.bulk_default_types = []
 
-# Explorer selections stored as (cls, carrier) -> set(plan names)
 if "explorer_selected_names" not in st.session_state:
     st.session_state.explorer_selected_names = {}
 
-# carriers selected in explorer (target carriers)
 if "explorer_carriers_selected" not in st.session_state:
     st.session_state.explorer_carriers_selected = []
 
@@ -646,7 +666,7 @@ if st.session_state.loaded:
                 for car in selected_carriers_for_rule:
                     plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
                     st.session_state.explorer_selected_names[(cls, car)] = set(plans)
-                    st.session_state[ms_key_for(cls, car)] = plans  # IMPORTANT: update widget state
+                    st.session_state[ms_key_for(cls, car)] = plans  # update widget state
 
             def explorer_clear_all_plans_global():
                 cls = st.session_state.active_global_class_filter
@@ -654,7 +674,7 @@ if st.session_state.loaded:
                     return
                 for car in selected_carriers_for_rule:
                     st.session_state.explorer_selected_names[(cls, car)] = set()
-                    st.session_state[ms_key_for(cls, car)] = []  # IMPORTANT: update widget state
+                    st.session_state[ms_key_for(cls, car)] = []  # update widget state
 
             pp1, pp2 = st.columns(2)
             with pp1:
@@ -672,17 +692,14 @@ if st.session_state.loaded:
             for car in render_carriers:
                 plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
                 bucket = (active_cls, car)
-                current = set(st.session_state.explorer_selected_names.get(bucket, set()) or set())
 
-                # Ensure widget key exists (so buttons can set it)
+                # Ensure widget key exists
                 msk = ms_key_for(active_cls, car)
                 if msk not in st.session_state:
-                    # initialize widget value from stored selection
+                    current = set(st.session_state.explorer_selected_names.get(bucket, set()) or set())
                     st.session_state[msk] = sorted(list(current.intersection(set(plans))), key=lambda x: (x or "").lower())
 
                 # Default processing checkbox:
-                # - if carrier already in Summary selection -> checked True
-                # - else unchecked (user decides if this carrier should be removed)
                 pk = proc_key_for(active_cls, car)
                 if pk not in st.session_state:
                     st.session_state[pk] = ((car, active_cls) in st.session_state.selected_pairs)
@@ -691,14 +708,12 @@ if st.session_state.loaded:
                 exp_label = f"{car} — selected {selected_count} / {len(plans)}"
 
                 with st.expander(exp_label, expanded=False):
-                    # Process toggle (THIS is what you asked for)
                     st.checkbox(
                         "Process this carrier (add to Summary if missing)",
                         key=pk,
                         help="If checked, Confirm/Apply will ensure this carrier is included in Summary and apply the rule.",
                     )
 
-                    # Per-carrier select all / clear that updates WIDGET state too
                     def _sel_all_carrier(carrier=car):
                         cls = st.session_state.active_global_class_filter
                         if not cls:
@@ -716,30 +731,15 @@ if st.session_state.loaded:
 
                     b1, b2 = st.columns(2)
                     with b1:
-                        st.button(
-                            "Select all for this carrier",
-                            use_container_width=True,
-                            on_click=_sel_all_carrier,
-                            key=f"sel_all_{stable_key(active_cls, car)}",
-                        )
+                        st.button("Select all for this carrier", use_container_width=True, on_click=_sel_all_carrier, key=f"sel_all_{stable_key(active_cls, car)}")
                     with b2:
-                        st.button(
-                            "Clear for this carrier",
-                            use_container_width=True,
-                            on_click=_clear_carrier,
-                            key=f"clr_{stable_key(active_cls, car)}",
-                        )
+                        st.button("Clear for this carrier", use_container_width=True, on_click=_clear_carrier, key=f"clr_{stable_key(active_cls, car)}")
 
-                    picked = st.multiselect(
-                        "Plan names",
-                        options=plans,
-                        key=msk,  # widget state is source of truth
-                    )
+                    picked = st.multiselect("Plan names", options=plans, key=msk)
                     st.session_state.explorer_selected_names[bucket] = set(picked)
 
             st.divider()
 
-            # Confirm / Apply
             def apply_explorer_rule():
                 cls = st.session_state.active_global_class_filter
                 if not cls:
@@ -752,7 +752,6 @@ if st.session_state.loaded:
                 added_to_summary = 0
 
                 for car in selected_carriers_for_rule:
-                    # Only apply if user chose "process this carrier"
                     if not st.session_state.get(proc_key_for(cls, car), False):
                         continue
 
@@ -760,7 +759,6 @@ if st.session_state.loaded:
                     if not names:
                         continue
 
-                    # Ensure carrier is in Summary selection
                     pair = (car, cls)
                     if pair not in st.session_state.selected_pairs:
                         st.session_state.selected_pairs.add(pair)
@@ -798,7 +796,7 @@ if st.session_state.loaded:
                 st.button("🧹 Clear ACTIVE rules for this classification", use_container_width=True, on_click=clear_rules_for_this_class)
 
     # ---------------------------
-    # RIGHT: Summary
+    # RIGHT: Summary + Output
     # ---------------------------
     with right:
         st.markdown("### Summary (what will be processed)")
@@ -838,23 +836,6 @@ if st.session_state.loaded:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             st.divider()
-            st.markdown("### ACTIVE Plan-Name Rules")
-            if not st.session_state.active_plan_rules:
-                st.caption("No active plan-name rules.")
-            else:
-                rule_rows = []
-                for (cls, car), rule in sorted(st.session_state.active_plan_rules.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
-                    rule_rows.append(
-                        {
-                            "Classification": cls,
-                            "Carrier": car,
-                            "Mode": rule.get("mode"),
-                            "Plan names count": len(rule.get("names", set()) or set()),
-                        }
-                    )
-                st.dataframe(pd.DataFrame(rule_rows), use_container_width=True, hide_index=True)
-
-            st.divider()
             st.markdown("### Preview / Generate")
 
             if st.button("Preview removal counts", use_container_width=True):
@@ -876,6 +857,18 @@ if st.session_state.loaded:
                 st.success(f"Preview ready. Total rows: {total_preview}")
                 st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
+            st.divider()
+
+            output_format = st.radio(
+                "Output format",
+                options=[
+                    "Current output (one row per PlanId)",
+                    "Grouped output (comma-separated PlanIds per ProviderId+LocationId)",
+                ],
+                index=0,
+                key="output_format_choice",
+            )
+
             generate = st.button("FINAL: Generate Removal Output", type="primary", use_container_width=True)
             if generate:
                 with st.spinner("Computing removals..."):
@@ -891,12 +884,20 @@ if st.session_state.loaded:
                 if total_rows == 0:
                     st.warning("No removals matched.")
                 else:
-                    st.success(f"Removals: {total_rows} rows | Tabs: {len(tabs_final)}")
-                    xbytes = make_excel_bytes(tabs_final)
+                    if output_format.startswith("Grouped"):
+                        tabs_to_write = group_plans_comma(tabs_final)
+                        file_name = "removal_output_grouped.xlsx"
+                    else:
+                        tabs_to_write = tabs_final
+                        file_name = "removal_output.xlsx"
+
+                    xbytes = make_excel_bytes(tabs_to_write)
+
+                    st.success(f"Removals computed. Tabs: {len(tabs_to_write)}")
                     st.download_button(
-                        "Download removal_output.xlsx",
+                        f"Download {file_name}",
                         data=xbytes,
-                        file_name="removal_output.xlsx",
+                        file_name=file_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
