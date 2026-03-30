@@ -6,17 +6,17 @@ import streamlit as st
 
 st.set_page_config(page_title="Carrier Removal Tool", layout="wide")
 
-# -----------------------------
+# =========================================================
 # Required columns
-# -----------------------------
+# =========================================================
 INPUT_REQUIRED_COLS = ["PracticeId", "ProviderId", "LocationId", "PlanIds", "MappingLevel"]
 DB_REQUIRED_COLS = ["Carrier_ID", "Carrier_Name", "Plan_ID", "Plan_Name", "Plan_Type", "Plan Classification"]
 DEPRECATED_ACCEPTABLE_PLAN_ID_COLS = ["Plan_ID", "PlanId", "plan_id", "planid"]
 
 
-# -----------------------------
+# =========================================================
 # Helpers
-# -----------------------------
+# =========================================================
 def split_csv_ids(cell_value: str):
     if cell_value is None:
         return []
@@ -38,7 +38,7 @@ def read_table(uploaded_file) -> pd.DataFrame:
         return pd.read_csv(uploaded_file, dtype=str).fillna("")
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(uploaded_file, dtype=str).fillna("")
-    raise ValueError("Unsupported file type. Please upload .csv or .xlsx")
+    raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
 
 
 def validate_columns(df: pd.DataFrame, required_cols: list[str], label: str):
@@ -100,6 +100,8 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
     carrier_to_types = {}
     carrier_to_plan_names = {}
     classification_to_carriers = {}
+    classification_to_types = {}
+    class_carrier_to_types = {}
     plan_types_universe = set()
 
     input_plan_ids = extract_input_plan_ids(input_df)
@@ -122,6 +124,8 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
         carrier_to_types.setdefault(carrier, set()).add(ptype)
         carrier_to_plan_names.setdefault(carrier, set()).add(pname)
         classification_to_carriers.setdefault(pcl, set()).add(carrier)
+        classification_to_types.setdefault(pcl, set()).add(ptype)
+        class_carrier_to_types.setdefault((pcl, carrier), set()).add(ptype)
         plan_types_universe.add(ptype)
 
     return {
@@ -129,14 +133,16 @@ def analyze_universe(input_df: pd.DataFrame, plan_lookup: dict):
         "carrier_to_types": carrier_to_types,
         "carrier_to_plan_names": carrier_to_plan_names,
         "classification_to_carriers": classification_to_carriers,
+        "classification_to_types": classification_to_types,
+        "class_carrier_to_types": class_carrier_to_types,
         "plan_types_universe": plan_types_universe,
         "missing_plan_ids": missing_plan_ids,
     }
 
 
-# -----------------------------
+# =========================================================
 # Performance helpers
-# -----------------------------
+# =========================================================
 def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
     base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
     base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
@@ -146,19 +152,22 @@ def build_input_long(input_df: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
-# -----------------------------
+# =========================================================
 # Plan-name rules
-# Rules keyed by (classification, carrier) OR wildcard carrier "*"
 # mode:
-#   ALL        => no rule (remove all)
+#   ALL        => no rule
 #   ONLY       => remove ONLY selected names
 #   ALL_EXCEPT => remove ALL EXCEPT selected names (preserve list)
-# -----------------------------
+# =========================================================
 def _rule_match_series(plan_name_series: pd.Series, names: set[str], keywords: list[str]) -> pd.Series:
     name_match = plan_name_series.isin(names) if names else pd.Series(False, index=plan_name_series.index)
     if keywords:
         pat = "|".join(re.escape(k) for k in keywords if k)
-        kw_match = plan_name_series.str.contains(pat, case=False, na=False, regex=True) if pat else pd.Series(False, index=plan_name_series.index)
+        kw_match = (
+            plan_name_series.str.contains(pat, case=False, na=False, regex=True)
+            if pat
+            else pd.Series(False, index=plan_name_series.index)
+        )
     else:
         kw_match = pd.Series(False, index=plan_name_series.index)
     return name_match | kw_match
@@ -199,7 +208,7 @@ def compute_removals_fast(
     if df.empty:
         return {}
 
-    # Apply plan rules (specific carrier overrides wildcard)
+    # Apply plan-name rules
     if active_plan_rules:
         rule_key = []
         for cls, car in zip(df["Plan Classification"], df["Carrier_Name"]):
@@ -290,12 +299,6 @@ def make_excel_bytes(tabs: dict[str, pd.DataFrame]) -> bytes:
 
 
 def group_plans_comma(tabs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """
-    Convert each MappingLevel tab from:
-      ProviderId | LocationId | PlanId (one per row)
-    to:
-      ProviderId | LocationId | PlanIds (comma-separated)
-    """
     out = {}
     for lvl, df in tabs.items():
         if df is None or df.empty:
@@ -304,7 +307,7 @@ def group_plans_comma(tabs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 
         g = (
             df.groupby(["ProviderId", "LocationId"], as_index=False)["PlanId"]
-              .apply(lambda s: ",".join(sorted(set([str(x).strip() for x in s if str(x).strip()]))))
+            .apply(lambda s: ",".join(sorted(set([str(x).strip() for x in s if str(x).strip()]))))
         )
         g = g.rename(columns={"PlanId": "PlanIds"})
         out[lvl] = g
@@ -324,9 +327,43 @@ def proc_key_for(cls: str, carrier: str) -> str:
     return f"proc__{stable_key(cls, carrier)}"
 
 
-# -----------------------------
+def type_override_mode_key_for(cls: str, carrier: str) -> str:
+    return f"type_override_mode__{stable_key(cls, carrier)}"
+
+
+def type_override_values_key_for(cls: str, carrier: str) -> str:
+    return f"type_override_values__{stable_key(cls, carrier)}"
+
+
+def get_pair_type_summary(val):
+    if val is None:
+        return "No matching plan type"
+    if not val:
+        return "All plan types"
+    return ", ".join(sorted(val, key=lambda x: x.lower()))
+
+
+def apply_default_types_to_selected_pairs(active_cls: str, default_types: list[str]):
+    if not active_cls:
+        return
+
+    default_types_set = set(default_types or [])
+    new_map = dict(st.session_state.pair_types_map)
+
+    for carrier, cls in st.session_state.selected_pairs:
+        if cls != active_cls:
+            continue
+        if default_types_set:
+            new_map[(carrier, cls)] = set(default_types_set)
+        else:
+            new_map[(carrier, cls)] = set()
+
+    st.session_state.pair_types_map = new_map
+
+
+# =========================================================
 # Session state init
-# -----------------------------
+# =========================================================
 if "selected_pairs" not in st.session_state:
     st.session_state.selected_pairs = set()
 
@@ -358,88 +395,123 @@ if "explorer_carriers_selected" not in st.session_state:
     st.session_state.explorer_carriers_selected = []
 
 
-# -----------------------------
-# UI header
-# -----------------------------
-st.title("Removal Tool")
+# =========================================================
+# Header
+# =========================================================
+st.title("Carrier Removal Tool")
 
-st.info(
-    "📌 **DB file requirements (upload .xlsx or .csv):**\n"
-    f"- Must contain these columns exactly: **{', '.join(DB_REQUIRED_COLS)}**\n"
-    "- **Plan_ID** values should include the `ip_` prefix (example: `ip_20356`).\n"
-    "\n"
-    "📌 **Input CSV requirements:**\n"
-    f"- Must contain: **{', '.join(INPUT_REQUIRED_COLS)}**\n"
+st.markdown(
+    """
+This tool helps you:
+1. Upload your input and DB files  
+2. Choose a **Plan Classification**  
+3. Select the **Carriers** to process  
+4. Choose **Plan Types** for all carriers or customize per carrier  
+5. Optionally narrow down using **Plan Names**  
+6. Preview and download the removal output
+"""
 )
 
-# -----------------------------
+st.info(
+    "📌 **DB file requirements (.xlsx / .xls / .csv):**\n"
+    f"- Must contain these columns exactly: **{', '.join(DB_REQUIRED_COLS)}**\n"
+    "- **Plan_ID** values should include the `ip_` prefix (example: `ip_20356`).\n\n"
+    "📌 **Input CSV requirements:**\n"
+    f"- Must contain these columns: **{', '.join(INPUT_REQUIRED_COLS)}**"
+)
+
+
+# =========================================================
 # Uploads
-# -----------------------------
+# =========================================================
+st.markdown("## Step 1: Upload files")
+
 col_up1, col_up2, col_up3 = st.columns([1, 1, 1])
 with col_up1:
-    input_file = st.file_uploader("Upload Input CSV", type=["csv"])
+    input_file = st.file_uploader(
+        "Upload Input CSV",
+        type=["csv"],
+        help="Upload the input file that contains PracticeId, ProviderId, LocationId, PlanIds, and MappingLevel.",
+    )
 with col_up2:
-    db_file = st.file_uploader("Upload DB (Excel/CSV)", type=["xlsx", "xls", "csv"])
+    db_file = st.file_uploader(
+        "Upload DB file",
+        type=["xlsx", "xls", "csv"],
+        help="Upload the DB mapping file with carrier, plan, type, and classification details.",
+    )
 with col_up3:
-    dep_file = st.file_uploader("Upload Deprecated Plans (optional)", type=["xlsx", "xls", "csv"])
+    dep_file = st.file_uploader(
+        "Upload Deprecated Plans file (optional)",
+        type=["xlsx", "xls", "csv"],
+        help="Optional. Upload this if you want to compare missing Plan IDs against deprecated plans.",
+    )
 
-load_btn = st.button("Load & Analyze", type="primary")
+load_btn = st.button("Load and analyze files", type="primary")
 
 
-# -----------------------------
+# =========================================================
 # Load
-# -----------------------------
+# =========================================================
 if load_btn:
     if input_file is None or db_file is None:
-        st.error("Please upload both Input CSV and DB file.")
+        st.error("Please upload both the Input CSV and the DB file.")
     else:
         prog = st.progress(0, text="Starting...")
         try:
-            prog.progress(10, text="Reading input...")
+            prog.progress(10, text="Reading input file...")
             input_df = read_table(input_file)
             validate_columns(input_df, INPUT_REQUIRED_COLS, "Input CSV")
             for c in INPUT_REQUIRED_COLS:
                 input_df[c] = input_df[c].astype(str).map(normalize_str)
 
-            prog.progress(30, text="Reading DB...")
+            prog.progress(30, text="Reading DB file...")
             db_df = read_table(db_file)
             validate_columns(db_df, DB_REQUIRED_COLS, "DB file")
 
-            prog.progress(45, text="Normalizing Plan_ID...")
+            prog.progress(45, text="Normalizing Plan_ID values...")
             db_df = explode_db_plan_ids(db_df)
 
-            prog.progress(60, text="Building plan lookup...")
+            prog.progress(60, text="Building lookup tables...")
             plan_lookup = build_plan_lookup(db_df)
 
-            prog.progress(75, text="Analyzing universe...")
+            prog.progress(75, text="Analyzing available carriers, classifications, and plan types...")
             universe = analyze_universe(input_df, plan_lookup)
             missing_plan_ids = universe["missing_plan_ids"]
 
             deprecated_found = 0
             deprecated_total = 0
             if dep_file is not None:
-                prog.progress(85, text="Reading deprecated file...")
+                prog.progress(85, text="Reading deprecated plans file...")
                 dep_df = read_table(dep_file)
                 dep_ids = read_deprecated_plan_ids(dep_df)
                 deprecated_total = len(dep_ids)
                 deprecated_found = len(missing_plan_ids.intersection(dep_ids))
 
-            prog.progress(92, text="Caching tables...")
+            prog.progress(92, text="Saving prepared data...")
             st.session_state.input_long = build_input_long(input_df)
-            st.session_state.db_small = db_df[["Plan_ID", "Carrier_Name", "Plan_Type", "Plan Classification", "Plan_Name"]].copy()
+            st.session_state.db_small = db_df[
+                ["Plan_ID", "Carrier_Name", "Plan_Type", "Plan Classification", "Plan_Name"]
+            ].copy()
 
             st.session_state.universe = universe
-            st.session_state.all_classifications = sorted(universe["classification_to_carriers"].keys(), key=lambda x: x.lower())
-            st.session_state.all_types = sorted(universe["plan_types_universe"], key=lambda x: x.lower())
+            st.session_state.all_classifications = sorted(
+                universe["classification_to_carriers"].keys(),
+                key=lambda x: x.lower()
+            )
+            st.session_state.all_types = sorted(
+                universe["plan_types_universe"],
+                key=lambda x: x.lower()
+            )
             st.session_state.missing_plan_ids_count = len(missing_plan_ids)
             st.session_state.deprecated_found = deprecated_found
             st.session_state.deprecated_total = deprecated_total
 
-            # reset user selections
+            # Reset selections
             st.session_state.selected_pairs = set()
             st.session_state.pair_types_map = {}
             st.session_state.active_plan_rules = {}
             st.session_state.carrier_add_picker = []
+            st.session_state.bulk_default_types = []
             st.session_state.explorer_selected_names = {}
             st.session_state.explorer_carriers_selected = []
             st.session_state.active_global_class_filter = None
@@ -447,24 +519,25 @@ if load_btn:
 
             st.session_state.loaded = True
             prog.progress(100, text="Done.")
-            st.success("Loaded successfully.")
+            st.success("Files loaded successfully.")
         except Exception as e:
             prog.progress(100, text="Failed.")
             st.error(str(e))
 
 
-# -----------------------------
+# =========================================================
 # Main UI
-# -----------------------------
+# =========================================================
 if st.session_state.loaded:
     universe = st.session_state.universe
     classification_to_carriers = universe["classification_to_carriers"]
+    classification_to_types = universe["classification_to_types"]
+    class_carrier_to_types = universe["class_carrier_to_types"]
     carrier_to_plan_names = universe["carrier_to_plan_names"]
-    carrier_to_types = universe["carrier_to_types"]
 
     # Sidebar
     with st.sidebar:
-        st.header("Pick a Classification")
+        st.header("Current working view")
 
         class_filter = st.selectbox(
             "Plan Classification",
@@ -472,15 +545,17 @@ if st.session_state.loaded:
             index=0,
             format_func=lambda x: "Select a classification" if x == "(select)" else x,
             key="sidebar_class_filter",
+            help="Choose the classification you want to work on.",
         )
 
         st.divider()
-        st.caption("🔎 View-only search (never removes selection)")
+
         view_search = st.text_input(
-            "Search carriers OR plan names",
+            "Search carriers or plan names",
             value="",
-            placeholder="Example: aetna OR rae OR rocky",
+            placeholder="Example: aetna or rocky",
             key="sidebar_view_search",
+            help="This only helps you find items on screen. It does not affect the final output unless you select them.",
         )
 
         st.divider()
@@ -489,21 +564,23 @@ if st.session_state.loaded:
         if st.session_state.get("deprecated_total", 0):
             st.warning(f"Missing in DB: {miss} | Deprecated matched: {dep_found}")
         else:
-            st.info(f"Missing in DB: {miss} (upload deprecated file to match)")
+            st.info(f"Missing in DB: {miss} (upload deprecated file to compare)")
 
-    # active class
     active_cls = None if class_filter == "(select)" else class_filter
     st.session_state.active_global_class_filter = active_cls
     disabled_pick = active_cls is None
 
-    # clear per-class UI widgets on class change (but keep summary)
     if class_filter != st.session_state.prev_class_filter:
         st.session_state.carrier_add_picker = []
         st.session_state.explorer_carriers_selected = []
+        st.session_state.bulk_default_types = []
         st.session_state.prev_class_filter = class_filter
 
-    # displayed carriers
-    carriers_base = sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower()) if active_cls else []
+    carriers_base = (
+        sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower())
+        if active_cls else []
+    )
+
     if active_cls and view_search.strip():
         q = view_search.strip().lower()
         filtered = []
@@ -518,19 +595,27 @@ if st.session_state.loaded:
     else:
         displayed_carriers = carriers_base
 
-    st.subheader("Dashboard")
-    left, right = st.columns([2, 1], gap="large")
+    st.markdown("## Step 2 onward: Make your selections")
 
-    # ---------------------------
+    left, right = st.columns([2.2, 1.2], gap="large")
+
+    # =====================================================
     # LEFT
-    # ---------------------------
+    # =====================================================
     with left:
-        st.markdown("### 1) Pick Carriers")
-
+        st.markdown("### Step 2: Choose a plan classification")
         if disabled_pick:
-            st.info("Select a Plan Classification in the sidebar.")
+            st.info("Start by selecting a Plan Classification from the left sidebar.")
         else:
-            st.caption("Glimpse: " + (" • ".join(displayed_carriers[:5]) if displayed_carriers else "(none)"))
+            st.success(f"Working on classification: **{active_cls}**")
+            st.caption(
+                f"Carriers visible in this classification: {len(displayed_carriers)}"
+            )
+
+        # -------------------------------------------------
+        # Step 3: Carrier selection
+        # -------------------------------------------------
+        st.markdown("### Step 3: Select carriers")
 
         def add_all_shown():
             cls = st.session_state.active_global_class_filter
@@ -559,54 +644,184 @@ if st.session_state.loaded:
             st.session_state.explorer_selected_names = {}
             st.session_state.explorer_carriers_selected = []
             st.session_state.carrier_add_picker = []
+            st.session_state.bulk_default_types = []
 
         st.session_state["displayed_carriers_cache"] = list(displayed_carriers)
 
         colA, colB, colC = st.columns([1, 1, 2])
         with colA:
-            st.button("Select all shown", disabled=disabled_pick, on_click=add_all_shown)
+            st.button("Add all shown", disabled=disabled_pick, on_click=add_all_shown)
         with colB:
-            st.button("Clear ALL", on_click=clear_all_selections)
+            st.button("Clear everything", on_click=clear_all_selections)
         with colC:
             selected_total = len(st.session_state.selected_pairs)
             selected_in_cls = len([1 for (_, cls) in st.session_state.selected_pairs if cls == active_cls]) if active_cls else 0
-            st.caption(f"Shown: {len(displayed_carriers)} | Selected (this class): {selected_in_cls} | Selected (total): {selected_total}")
+            st.caption(
+                f"Visible: {len(displayed_carriers)} | Selected in this classification: {selected_in_cls} | Total selected: {selected_total}"
+            )
 
         st.multiselect(
-            "Select carriers to add",
+            "Choose carriers to add",
             options=displayed_carriers,
             key="carrier_add_picker",
-            label_visibility="collapsed",
             disabled=disabled_pick,
+            help="Pick one or more carriers, then click 'Add selected carriers'.",
         )
-        st.button("Add selected carriers", use_container_width=True, disabled=disabled_pick, on_click=add_selected_carriers)
+        st.button(
+            "Add selected carriers",
+            use_container_width=True,
+            disabled=disabled_pick,
+            on_click=add_selected_carriers,
+        )
 
-        # ---------------------------
-        # Plan Name Explorer
-        # ---------------------------
+        # -------------------------------------------------
+        # Step 4: Plan type selection
+        # -------------------------------------------------
         st.divider()
-        st.markdown("### 2) Plan Name Explorer (smart)")
+        st.markdown("### Step 4: Choose plan types")
+        st.caption(
+            "You can apply one default plan type selection to all selected carriers in this classification, "
+            "and then override it for specific carriers if needed."
+        )
+
+        selected_pairs_in_active_cls = sorted(
+            [(carrier, cls) for (carrier, cls) in st.session_state.selected_pairs if cls == active_cls],
+            key=lambda x: x[0].lower()
+        )
+
+        available_types_for_class = sorted(
+            list(classification_to_types.get(active_cls, set())),
+            key=lambda x: x.lower()
+        ) if active_cls else []
+
+        if disabled_pick:
+            st.info("Select a classification first.")
+        elif not selected_pairs_in_active_cls:
+            st.info("Select at least one carrier before choosing plan types.")
+        else:
+            st.markdown("#### Default plan types for all selected carriers")
+            st.multiselect(
+                "Default plan types",
+                options=available_types_for_class,
+                key="bulk_default_types",
+                help=(
+                    "Leave this empty to include all plan types. "
+                    "If you choose one or more values, those plan types will be used for all selected carriers in this classification."
+                ),
+            )
+
+            def apply_default_plan_types():
+                apply_default_types_to_selected_pairs(active_cls, st.session_state.bulk_default_types)
+
+            st.button(
+                "Apply default plan types to selected carriers",
+                use_container_width=True,
+                on_click=apply_default_plan_types,
+            )
+
+            st.markdown("#### Optional carrier-level overrides")
+            st.caption("Use this only when one carrier needs different plan types from the default.")
+
+            MAX_CARRIER_TYPE_RENDER = 40
+            if len(selected_pairs_in_active_cls) > MAX_CARRIER_TYPE_RENDER:
+                st.warning(
+                    f"Showing the first {MAX_CARRIER_TYPE_RENDER} selected carriers in this section. "
+                    "If needed, reduce the number of selected carriers."
+                )
+
+            for carrier, cls in selected_pairs_in_active_cls[:MAX_CARRIER_TYPE_RENDER]:
+                carrier_types = sorted(
+                    list(class_carrier_to_types.get((cls, carrier), set())),
+                    key=lambda x: x.lower()
+                )
+
+                mode_key = type_override_mode_key_for(cls, carrier)
+                values_key = type_override_values_key_for(cls, carrier)
+
+                current_val = st.session_state.pair_types_map.get((carrier, cls), set())
+
+                if mode_key not in st.session_state:
+                    st.session_state[mode_key] = "Use default / all"
+
+                if values_key not in st.session_state:
+                    if isinstance(current_val, set) and current_val:
+                        st.session_state[values_key] = sorted(list(current_val), key=lambda x: x.lower())
+                    else:
+                        st.session_state[values_key] = []
+
+                with st.expander(f"{carrier}", expanded=False):
+                    st.radio(
+                        "How should this carrier use plan types?",
+                        options=[
+                            "Use default / all",
+                            "Only selected plan types",
+                        ],
+                        key=mode_key,
+                        help=(
+                            "Use default / all: this carrier will follow the default selection. "
+                            "Only selected plan types: this carrier will use only the types you pick below."
+                        ),
+                    )
+
+                    st.multiselect(
+                        f"Plan types for {carrier}",
+                        options=carrier_types,
+                        key=values_key,
+                        help="Pick the plan types to use for this carrier if you want a carrier-specific override.",
+                    )
+
+                    def save_type_override(c=carrier, cl=cls, mk=mode_key, vk=values_key):
+                        mode = st.session_state.get(mk, "Use default / all")
+                        selected_vals = st.session_state.get(vk, [])
+
+                        if mode == "Only selected plan types":
+                            st.session_state.pair_types_map[(c, cl)] = set(selected_vals)
+                        else:
+                            if st.session_state.get("bulk_default_types", []):
+                                st.session_state.pair_types_map[(c, cl)] = set(st.session_state["bulk_default_types"])
+                            else:
+                                st.session_state.pair_types_map[(c, cl)] = set()
+
+                    st.button(
+                        f"Save plan type setting for {carrier}",
+                        key=f"save_type_override_{stable_key(cls, carrier)}",
+                        on_click=save_type_override,
+                        use_container_width=True,
+                    )
+
+        # -------------------------------------------------
+        # Step 5: Plan name explorer
+        # -------------------------------------------------
+        st.divider()
+        st.markdown("### Step 5: Optional plan name filtering")
+        st.caption(
+            "Use this section only if you want to narrow the removal list further by plan name."
+        )
 
         explorer_kw = st.text_input(
-            "Plan keyword",
+            "Search plan names by keyword",
             value="",
-            placeholder="Example: rae OR rocky OR denver",
+            placeholder="Example: rocky or denver",
             disabled=disabled_pick,
             key="explorer_kw",
+            help="Enter a keyword to find matching plan names under the selected classification.",
         )
 
         explorer_mode = st.radio(
-            "Your selection means:",
+            "How should selected plan names be treated?",
             options=[
-                "ALLOW (keep these plan names; remove everything else under these carriers)",
-                "REMOVE ONLY (remove only these plan names under these carriers)",
+                "Keep only these plan names",
+                "Remove only these plan names",
             ],
             index=0,
             disabled=disabled_pick,
             key="explorer_mode",
+            help=(
+                "Keep only these plan names = remove everything else for those carriers.\n"
+                "Remove only these plan names = only those plan names will be removed."
+            ),
         )
 
-        # Build carrier -> matching plan names
         by_carrier = {}
         if (not disabled_pick) and explorer_kw.strip():
             kw = explorer_kw.strip()
@@ -626,16 +841,15 @@ if st.session_state.loaded:
         carriers_found = sorted(by_carrier.keys(), key=lambda x: x.lower())
 
         if disabled_pick:
-            st.info("Select a classification to use Plan Name Explorer.")
+            st.info("Select a classification first to use plan name filtering.")
         elif not explorer_kw.strip():
-            st.info("Enter a plan keyword to view carriers + plan names.")
+            st.info("Enter a keyword if you want to filter by plan name.")
         elif not carriers_found:
-            st.warning("No matching plan names found for this keyword under this classification.")
+            st.warning("No matching plan names found for this classification.")
         else:
             total_plans = sum(len(v) for v in by_carrier.values())
             st.success(f"Found {total_plans} matching plan names across {len(carriers_found)} carriers.")
 
-            # Carriers to apply this selection to
             if not st.session_state.explorer_carriers_selected:
                 st.session_state.explorer_carriers_selected = list(carriers_found)
 
@@ -647,18 +861,17 @@ if st.session_state.loaded:
 
             cc1, cc2 = st.columns(2)
             with cc1:
-                st.button("Select ALL carriers found", use_container_width=True, on_click=explorer_select_all_carriers)
+                st.button("Select all carriers found", use_container_width=True, on_click=explorer_select_all_carriers)
             with cc2:
                 st.button("Clear carrier selection", use_container_width=True, on_click=explorer_clear_all_carriers)
 
             st.multiselect(
-                "Carriers to apply this plan-name selection to",
+                "Choose carriers for this plan-name rule",
                 options=carriers_found,
                 key="explorer_carriers_selected",
             )
             selected_carriers_for_rule = list(st.session_state.explorer_carriers_selected)
 
-            # --- Global Plan actions that REALLY work ---
             def explorer_select_all_plans_global():
                 cls = st.session_state.active_global_class_filter
                 if not cls:
@@ -666,7 +879,7 @@ if st.session_state.loaded:
                 for car in selected_carriers_for_rule:
                     plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
                     st.session_state.explorer_selected_names[(cls, car)] = set(plans)
-                    st.session_state[ms_key_for(cls, car)] = plans  # update widget state
+                    st.session_state[ms_key_for(cls, car)] = plans
 
             def explorer_clear_all_plans_global():
                 cls = st.session_state.active_global_class_filter
@@ -674,44 +887,40 @@ if st.session_state.loaded:
                     return
                 for car in selected_carriers_for_rule:
                     st.session_state.explorer_selected_names[(cls, car)] = set()
-                    st.session_state[ms_key_for(cls, car)] = []  # update widget state
+                    st.session_state[ms_key_for(cls, car)] = []
 
             pp1, pp2 = st.columns(2)
             with pp1:
-                st.button("Select ALL plan names shown", use_container_width=True, on_click=explorer_select_all_plans_global)
+                st.button("Select all plan names shown", use_container_width=True, on_click=explorer_select_all_plans_global)
             with pp2:
-                st.button("Clear ALL selected plan names", use_container_width=True, on_click=explorer_clear_all_plans_global)
-
-            st.caption("Pick plan names per carrier (fast + reliable).")
+                st.button("Clear all selected plan names", use_container_width=True, on_click=explorer_clear_all_plans_global)
 
             MAX_RENDER = 25
             if len(selected_carriers_for_rule) > MAX_RENDER:
-                st.warning(f"Showing first {MAX_RENDER} carriers. Narrow keyword if needed.")
+                st.warning(f"Showing the first {MAX_RENDER} carriers. Narrow the keyword if needed.")
             render_carriers = selected_carriers_for_rule[:MAX_RENDER]
 
             for car in render_carriers:
                 plans = sorted(list(by_carrier.get(car, set())), key=lambda x: (x or "").lower())
                 bucket = (active_cls, car)
 
-                # Ensure widget key exists
                 msk = ms_key_for(active_cls, car)
                 if msk not in st.session_state:
                     current = set(st.session_state.explorer_selected_names.get(bucket, set()) or set())
                     st.session_state[msk] = sorted(list(current.intersection(set(plans))), key=lambda x: (x or "").lower())
 
-                # Default processing checkbox:
                 pk = proc_key_for(active_cls, car)
                 if pk not in st.session_state:
                     st.session_state[pk] = ((car, active_cls) in st.session_state.selected_pairs)
 
                 selected_count = len(set(st.session_state[msk]))
-                exp_label = f"{car} — selected {selected_count} / {len(plans)}"
+                exp_label = f"{car} — selected {selected_count} of {len(plans)}"
 
                 with st.expander(exp_label, expanded=False):
                     st.checkbox(
-                        "Process this carrier (add to Summary if missing)",
+                        "Apply this plan-name rule to this carrier",
                         key=pk,
-                        help="If checked, Confirm/Apply will ensure this carrier is included in Summary and apply the rule.",
+                        help="If checked, this carrier will be included in the final rule when you confirm below.",
                     )
 
                     def _sel_all_carrier(carrier=car):
@@ -731,9 +940,19 @@ if st.session_state.loaded:
 
                     b1, b2 = st.columns(2)
                     with b1:
-                        st.button("Select all for this carrier", use_container_width=True, on_click=_sel_all_carrier, key=f"sel_all_{stable_key(active_cls, car)}")
+                        st.button(
+                            "Select all for this carrier",
+                            use_container_width=True,
+                            on_click=_sel_all_carrier,
+                            key=f"sel_all_{stable_key(active_cls, car)}",
+                        )
                     with b2:
-                        st.button("Clear for this carrier", use_container_width=True, on_click=_clear_carrier, key=f"clr_{stable_key(active_cls, car)}")
+                        st.button(
+                            "Clear for this carrier",
+                            use_container_width=True,
+                            on_click=_clear_carrier,
+                            key=f"clr_{stable_key(active_cls, car)}",
+                        )
 
                     picked = st.multiselect("Plan names", options=plans, key=msk)
                     st.session_state.explorer_selected_names[bucket] = set(picked)
@@ -746,7 +965,7 @@ if st.session_state.loaded:
                     return
 
                 mode_label = st.session_state.get("explorer_mode", "")
-                rule_mode = "ALL_EXCEPT" if mode_label.startswith("ALLOW") else "ONLY"
+                rule_mode = "ALL_EXCEPT" if mode_label.startswith("Keep only") else "ONLY"
 
                 applied = 0
                 added_to_summary = 0
@@ -762,7 +981,10 @@ if st.session_state.loaded:
                     pair = (car, cls)
                     if pair not in st.session_state.selected_pairs:
                         st.session_state.selected_pairs.add(pair)
-                        st.session_state.pair_types_map.setdefault(pair, set())
+                        if st.session_state.get("bulk_default_types", []):
+                            st.session_state.pair_types_map[pair] = set(st.session_state["bulk_default_types"])
+                        else:
+                            st.session_state.pair_types_map.setdefault(pair, set())
                         added_to_summary += 1
 
                     st.session_state.active_plan_rules[(cls, car)] = {
@@ -773,11 +995,11 @@ if st.session_state.loaded:
                     applied += 1
 
                 if applied == 0:
-                    st.warning("Nothing applied. For at least one carrier: check 'Process this carrier' and select at least 1 plan name.")
+                    st.warning("Nothing was applied. Select at least one plan name and choose at least one carrier.")
                 else:
                     msg = f"Applied plan-name rules to {applied} carriers for {cls}."
                     if added_to_summary:
-                        msg += f" Added {added_to_summary} carriers into Summary."
+                        msg += f" Added {added_to_summary} carriers into your selection."
                     st.success(msg)
 
             def clear_rules_for_this_class():
@@ -787,56 +1009,54 @@ if st.session_state.loaded:
                 to_del = [k for k in list(st.session_state.active_plan_rules.keys()) if k[0] == cls]
                 for k in to_del:
                     st.session_state.active_plan_rules.pop(k, None)
-                st.success(f"Cleared ACTIVE rules for {cls}.")
+                st.success(f"Cleared active plan-name rules for {cls}.")
 
             ap1, ap2 = st.columns(2)
             with ap1:
-                st.button("✅ Confirm / Apply plan-name rules", use_container_width=True, on_click=apply_explorer_rule)
+                st.button("Confirm and apply plan-name rules", use_container_width=True, on_click=apply_explorer_rule)
             with ap2:
-                st.button("🧹 Clear ACTIVE rules for this classification", use_container_width=True, on_click=clear_rules_for_this_class)
+                st.button("Clear active rules for this classification", use_container_width=True, on_click=clear_rules_for_this_class)
 
-    # ---------------------------
+    # =====================================================
     # RIGHT: Summary + Output
-    # ---------------------------
+    # =====================================================
     with right:
-        st.markdown("### Summary (what will be processed)")
+        st.markdown("### Step 6: Review your selection")
 
-        selected_pairs_sorted = sorted(list(st.session_state.selected_pairs), key=lambda x: (x[0].lower(), x[1].lower()))
+        selected_pairs_sorted = sorted(
+            list(st.session_state.selected_pairs),
+            key=lambda x: (x[0].lower(), x[1].lower())
+        )
+
         if not selected_pairs_sorted:
-            st.info("Select carriers to enable preview + output.")
+            st.info("Select carriers to enable preview and output.")
         else:
             rows = []
             for (carrier, cls) in selected_pairs_sorted:
                 types_val = st.session_state.pair_types_map.get((carrier, cls), set())
-                if types_val is None:
-                    types_label = "NO MATCH"
-                elif not types_val:
-                    types_label = "ALL"
-                else:
-                    types_label = f"{len(types_val)} selected"
 
                 rule = st.session_state.active_plan_rules.get((cls, carrier))
                 if rule is None:
-                    rule_mode = "ALL (no rule)"
+                    rule_mode = "No plan-name rule"
                     rule_count = 0
                 else:
-                    rule_mode = rule.get("mode", "ALL")
+                    rule_mode = "Keep only selected names" if rule.get("mode") == "ALL_EXCEPT" else "Remove only selected names"
                     rule_count = len(rule.get("names", set()) or set())
 
                 rows.append(
                     {
                         "Carrier": carrier,
                         "Plan Classification": cls,
-                        "Plan Types": types_label,
-                        "Plan Rule": rule_mode,
-                        "Plan Names Count": rule_count,
+                        "Plan Types": get_pair_type_summary(types_val),
+                        "Plan Name Rule": rule_mode,
+                        "Selected Plan Names": rule_count,
                     }
                 )
 
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             st.divider()
-            st.markdown("### Preview / Generate")
+            st.markdown("### Step 7: Preview and download")
 
             if st.button("Preview removal counts", use_container_width=True):
                 with st.spinner("Building preview..."):
@@ -860,16 +1080,17 @@ if st.session_state.loaded:
             st.divider()
 
             output_format = st.radio(
-                "Output format",
+                "Choose output format",
                 options=[
                     "Current output (one row per PlanId)",
-                    "Grouped output (comma-separated PlanIds per ProviderId+LocationId)",
+                    "Grouped output (comma-separated PlanIds per ProviderId + LocationId)",
                 ],
                 index=0,
                 key="output_format_choice",
+                help="Choose whether you want one row per PlanId or a grouped version.",
             )
 
-            generate = st.button("FINAL: Generate Removal Output", type="primary", use_container_width=True)
+            generate = st.button("Generate final removal output", type="primary", use_container_width=True)
             if generate:
                 with st.spinner("Computing removals..."):
                     tabs_final = compute_removals_fast(
@@ -882,7 +1103,7 @@ if st.session_state.loaded:
 
                 total_rows = sum(len(df) for df in tabs_final.values())
                 if total_rows == 0:
-                    st.warning("No removals matched.")
+                    st.warning("No removals matched your current selection.")
                 else:
                     if output_format.startswith("Grouped"):
                         tabs_to_write = group_plans_comma(tabs_final)
@@ -893,7 +1114,7 @@ if st.session_state.loaded:
 
                     xbytes = make_excel_bytes(tabs_to_write)
 
-                    st.success(f"Removals computed. Tabs: {len(tabs_to_write)}")
+                    st.success(f"Removal output is ready. Tabs created: {len(tabs_to_write)}")
                     st.download_button(
                         f"Download {file_name}",
                         data=xbytes,
