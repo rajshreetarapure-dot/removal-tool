@@ -1,5 +1,6 @@
 import io
 import re
+import gc
 import hashlib
 import traceback
 import pandas as pd
@@ -12,6 +13,7 @@ st.set_page_config(page_title="Carrier Removal Tool", layout="wide")
 # =========================================================
 INPUT_REQUIRED_COLS = ["PracticeId", "ProviderId", "LocationId", "PlanIds", "MappingLevel"]
 DB_REQUIRED_COLS = ["Carrier_ID", "Carrier_Name", "Plan_ID", "Plan_Name", "Plan_Type", "Plan Classification"]
+DB_SMALL_COLS = ["Plan_ID", "Carrier_Name", "Plan_Type", "Plan Classification", "Plan_Name"]
 DEPRECATED_ACCEPTABLE_PLAN_ID_COLS = ["Plan_ID", "PlanId", "plan_id", "planid"]
 
 
@@ -33,35 +35,107 @@ def normalize_str(x):
     return str(x).strip()
 
 
-def read_table(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, dtype=str).fillna("")
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file, dtype=str).fillna("")
-    raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
-
-
 def validate_columns(df, required_cols, label):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"{label} is missing required columns: {missing}")
 
 
-def explode_db_plan_ids(db_df):
-    db_df = db_df.copy()
+def stable_key(*parts):
+    raw = "||".join([p or "" for p in parts])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def ms_key_for(cls, carrier):
+    return f"ms__{stable_key(cls, carrier)}"
+
+
+def proc_key_for(cls, carrier):
+    return f"proc__{stable_key(cls, carrier)}"
+
+
+def type_override_mode_key_for(cls, carrier):
+    return f"type_override_mode__{stable_key(cls, carrier)}"
+
+
+def type_override_values_key_for(cls, carrier):
+    return f"type_override_values__{stable_key(cls, carrier)}"
+
+
+def get_pair_type_summary(val):
+    if val is None:
+        return "No matching plan type"
+    if not val:
+        return "All plan types"
+    return ", ".join(sorted(val, key=lambda x: x.lower()))
+
+
+# =========================================================
+# Cached file readers / preprocessors
+# =========================================================
+@st.cache_data(show_spinner=False)
+def read_uploaded_table(file_bytes, file_name):
+    name = file_name.lower()
+    bio = io.BytesIO(file_bytes)
+    if name.endswith(".csv"):
+        return pd.read_csv(bio, dtype=str).fillna("")
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(bio, dtype=str).fillna("")
+    raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_input_df(file_bytes, file_name):
+    input_df = read_uploaded_table(file_bytes, file_name)
+    validate_columns(input_df, INPUT_REQUIRED_COLS, "Input CSV")
+
+    for c in INPUT_REQUIRED_COLS:
+        input_df[c] = input_df[c].astype(str).map(normalize_str)
+
+    return input_df
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_db_df(file_bytes, file_name):
+    db_df = read_uploaded_table(file_bytes, file_name)
+    validate_columns(db_df, DB_REQUIRED_COLS, "DB file")
+
+    db_df = db_df[DB_REQUIRED_COLS].copy()
     for c in DB_REQUIRED_COLS:
-        if c in db_df.columns:
-            db_df[c] = db_df[c].astype(str).map(normalize_str)
+        db_df[c] = db_df[c].astype(str).map(normalize_str)
 
     db_df["_plan_split"] = db_df["Plan_ID"].apply(split_csv_ids)
     db_df = db_df.explode("_plan_split").reset_index(drop=True)
     db_df["Plan_ID"] = db_df["_plan_split"].fillna("").astype(str).map(normalize_str)
     db_df = db_df.drop(columns=["_plan_split"])
     db_df = db_df[db_df["Plan_ID"] != ""].reset_index(drop=True)
+
     return db_df
 
 
+@st.cache_data(show_spinner=False)
+def preprocess_deprecated_ids(file_bytes, file_name):
+    dep_df = read_uploaded_table(file_bytes, file_name)
+
+    col = None
+    for c in DEPRECATED_ACCEPTABLE_PLAN_ID_COLS:
+        if c in dep_df.columns:
+            col = c
+            break
+    if col is None:
+        raise ValueError(
+            f"Deprecated file must have a Plan_ID column (one of {DEPRECATED_ACCEPTABLE_PLAN_ID_COLS})."
+        )
+
+    dep_ids = set()
+    for v in dep_df[col].astype(str).fillna("").tolist():
+        for pid in split_csv_ids(v):
+            dep_ids.add(pid)
+
+    return dep_ids
+
+
+@st.cache_data(show_spinner=False)
 def build_plan_lookup(db_df):
     lookup = {}
     for _, row in db_df.iterrows():
@@ -71,6 +145,17 @@ def build_plan_lookup(db_df):
     return lookup
 
 
+@st.cache_data(show_spinner=False)
+def build_input_long(input_df):
+    base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
+    base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
+    base = base.explode("PlanId").drop(columns=["PlanIds"])
+    base["PlanId"] = base["PlanId"].astype(str).map(normalize_str)
+    base = base[base["PlanId"] != ""].reset_index(drop=True)
+    return base
+
+
+@st.cache_data(show_spinner=False)
 def extract_input_plan_ids(input_df):
     plan_ids = set()
     for v in input_df["PlanIds"].astype(str).tolist():
@@ -79,26 +164,10 @@ def extract_input_plan_ids(input_df):
     return plan_ids
 
 
-def read_deprecated_plan_ids(dep_df):
-    col = None
-    for c in DEPRECATED_ACCEPTABLE_PLAN_ID_COLS:
-        if c in dep_df.columns:
-            col = c
-            break
-    if col is None:
-        raise ValueError(
-            "Deprecated file must have a Plan_ID column "
-            f"(one of {DEPRECATED_ACCEPTABLE_PLAN_ID_COLS})."
-        )
+@st.cache_data(show_spinner=False)
+def analyze_universe_from_frames(input_df, db_df):
+    plan_lookup = build_plan_lookup(db_df)
 
-    dep_ids = set()
-    for v in dep_df[col].astype(str).fillna("").tolist():
-        for pid in split_csv_ids(v):
-            dep_ids.add(pid)
-    return dep_ids
-
-
-def analyze_universe(input_df, plan_lookup):
     carrier_to_classifications = {}
     carrier_to_types = {}
     carrier_to_plan_names = {}
@@ -144,23 +213,7 @@ def analyze_universe(input_df, plan_lookup):
 
 
 # =========================================================
-# Performance helpers
-# =========================================================
-def build_input_long(input_df):
-    base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
-    base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
-    base = base.explode("PlanId").drop(columns=["PlanIds"])
-    base["PlanId"] = base["PlanId"].astype(str).map(normalize_str)
-    base = base[base["PlanId"] != ""].reset_index(drop=True)
-    return base
-
-
-# =========================================================
 # Plan-name rules
-# mode:
-#   ALL        => no rule
-#   ONLY       => remove ONLY selected names
-#   ALL_EXCEPT => remove ALL EXCEPT selected names (preserve list)
 # =========================================================
 def _rule_match_series(plan_name_series, names, keywords):
     name_match = plan_name_series.isin(names) if names else pd.Series(False, index=plan_name_series.index)
@@ -176,18 +229,32 @@ def _rule_match_series(plan_name_series, names, keywords):
     return name_match | kw_match
 
 
+# =========================================================
+# Performance-focused compute
+# =========================================================
 def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, active_plan_rules):
     if not selected_pairs:
         return {}
 
+    if input_long is None or input_long.empty or db_small is None or db_small.empty:
+        return {}
+
+    allow_df = pd.DataFrame(list(selected_pairs), columns=["Carrier_Name", "Plan Classification"])
+    if allow_df.empty:
+        return {}
+
+    selected_plan_ids = set(input_long["PlanId"].astype(str).tolist())
+    db_filtered = db_small[db_small["Plan_ID"].isin(selected_plan_ids)].copy()
+    if db_filtered.empty:
+        return {}
+
     df = input_long.merge(
-        db_small,
+        db_filtered,
         left_on="PlanId",
         right_on="Plan_ID",
-        how="left",
+        how="inner",
         copy=False,
     )
-    df = df[df["Plan_ID"].notna()].copy()
     if df.empty:
         return {}
 
@@ -200,7 +267,6 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
     df.loc[df["Plan Classification"] == "", "Plan Classification"] = "(blank)"
     df.loc[df["Plan_Name"] == "", "Plan_Name"] = "(blank)"
 
-    allow_df = pd.DataFrame(list(selected_pairs), columns=["Carrier_Name", "Plan Classification"])
     df = df.merge(allow_df, on=["Carrier_Name", "Plan Classification"], how="inner", copy=False)
     if df.empty:
         return {}
@@ -224,6 +290,7 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
             rule = active_plan_rules.get(rk)
             if not rule:
                 continue
+
             mode = rule.get("mode", "ALL")
             if mode == "ALL":
                 continue
@@ -263,6 +330,7 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
         for (carrier, cls), typeset in restricted_types.items():
             for t in typeset:
                 allow_rows.append((carrier, cls, t))
+
         allow_types_df = pd.DataFrame(
             allow_rows,
             columns=["Carrier_Name", "Plan Classification", "Plan_Type"]
@@ -272,6 +340,7 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
             list(restricted_types.keys()),
             columns=["Carrier_Name", "Plan Classification"]
         )
+
         df_restr = df.merge(restricted_pairs_df, on=["Carrier_Name", "Plan Classification"], how="inner")
         df_all = df.merge(restricted_pairs_df.assign(__r=1), on=["Carrier_Name", "Plan Classification"], how="left")
         df_all = df_all[df_all["__r"].isna()].drop(columns=["__r"])
@@ -281,6 +350,7 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
             on=["Carrier_Name", "Plan Classification", "Plan_Type"],
             how="inner"
         )
+
         df = pd.concat([df_all, df_restr], ignore_index=True)
         if df.empty:
             return {}
@@ -293,17 +363,10 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
     for lvl, g in out_df.groupby("MappingLevel", sort=False):
         tabs[str(lvl)] = g[["ProviderId", "LocationId", "PlanId"]].reset_index(drop=True)
 
+    del df
+    gc.collect()
+
     return tabs
-
-
-def make_excel_bytes(tabs):
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        for sheet, df in tabs.items():
-            safe_name = (sheet or "UnknownLevel")[:31]
-            df.to_excel(writer, sheet_name=safe_name, index=False)
-    bio.seek(0)
-    return bio.getvalue()
 
 
 def group_plans_comma(tabs):
@@ -319,36 +382,18 @@ def group_plans_comma(tabs):
         )
         g = g.rename(columns={"PlanId": "PlanIds"})
         out[lvl] = g
+
     return out
 
 
-def stable_key(*parts):
-    raw = "||".join([p or "" for p in parts])
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-
-def ms_key_for(cls, carrier):
-    return "ms__" + stable_key(cls, carrier)
-
-
-def proc_key_for(cls, carrier):
-    return "proc__" + stable_key(cls, carrier)
-
-
-def type_override_mode_key_for(cls, carrier):
-    return "type_override_mode__" + stable_key(cls, carrier)
-
-
-def type_override_values_key_for(cls, carrier):
-    return "type_override_values__" + stable_key(cls, carrier)
-
-
-def get_pair_type_summary(val):
-    if val is None:
-        return "No matching plan type"
-    if not val:
-        return "All plan types"
-    return ", ".join(sorted(val, key=lambda x: x.lower()))
+def make_excel_bytes(tabs):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for sheet, df in tabs.items():
+            safe_name = (sheet or "UnknownLevel")[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+    bio.seek(0)
+    return bio.getvalue()
 
 
 def apply_default_types_to_selected_pairs(active_cls, default_types):
@@ -361,6 +406,7 @@ def apply_default_types_to_selected_pairs(active_cls, default_types):
     for carrier, cls in st.session_state.selected_pairs:
         if active_cls != "(all classifications)" and cls != active_cls:
             continue
+
         if default_types_set:
             new_map[(carrier, cls)] = set(default_types_set)
         else:
@@ -381,6 +427,7 @@ def init_session_state():
         "bulk_default_types": [],
         "explorer_selected_names": {},
         "explorer_carriers_selected": [],
+        "debug_stats": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -390,9 +437,6 @@ def init_session_state():
 def main():
     init_session_state()
 
-    # =========================================================
-    # Header
-    # =========================================================
     st.title("Carrier Removal Tool")
 
     st.markdown(
@@ -449,43 +493,45 @@ This tool helps you:
         if input_file is None or db_file is None:
             st.error("Please upload both the Input CSV and the DB file.")
         else:
-            prog = st.progress(0, text="Starting...")
+            prog = st.progress(0)
+            status = st.empty()
+
             try:
-                prog.progress(10, text="Reading input file...")
-                input_df = read_table(input_file)
-                validate_columns(input_df, INPUT_REQUIRED_COLS, "Input CSV")
-                for c in INPUT_REQUIRED_COLS:
-                    input_df[c] = input_df[c].astype(str).map(normalize_str)
+                input_bytes = input_file.getvalue()
+                db_bytes = db_file.getvalue()
+                dep_bytes = dep_file.getvalue() if dep_file is not None else None
 
-                prog.progress(30, text="Reading DB file...")
-                db_df = read_table(db_file)
-                validate_columns(db_df, DB_REQUIRED_COLS, "DB file")
+                prog.progress(10)
+                status.info("Reading input file...")
+                input_df = preprocess_input_df(input_bytes, input_file.name)
 
-                prog.progress(45, text="Normalizing Plan_ID values...")
-                db_df = explode_db_plan_ids(db_df)
+                prog.progress(30)
+                status.info("Reading DB file...")
+                db_df = preprocess_db_df(db_bytes, db_file.name)
 
-                prog.progress(60, text="Building lookup tables...")
-                plan_lookup = build_plan_lookup(db_df)
-
-                prog.progress(75, text="Analyzing available carriers, classifications, and plan types...")
-                universe = analyze_universe(input_df, plan_lookup)
+                prog.progress(55)
+                status.info("Analyzing carriers, classifications, and plan types...")
+                universe = analyze_universe_from_frames(input_df, db_df)
                 missing_plan_ids = universe["missing_plan_ids"]
 
                 deprecated_found = 0
                 deprecated_total = 0
-                if dep_file is not None:
-                    prog.progress(85, text="Reading deprecated plans file...")
-                    dep_df = read_table(dep_file)
-                    dep_ids = read_deprecated_plan_ids(dep_df)
+                if dep_bytes is not None:
+                    prog.progress(70)
+                    status.info("Reading deprecated plans file...")
+                    dep_ids = preprocess_deprecated_ids(dep_bytes, dep_file.name)
                     deprecated_total = len(dep_ids)
                     deprecated_found = len(missing_plan_ids.intersection(dep_ids))
 
-                prog.progress(92, text="Saving prepared data...")
-                st.session_state.input_long = build_input_long(input_df)
-                st.session_state.db_small = db_df[
-                    ["Plan_ID", "Carrier_Name", "Plan_Type", "Plan Classification", "Plan_Name"]
-                ].copy()
+                prog.progress(82)
+                status.info("Preparing long input and DB slices...")
+                input_long = build_input_long(input_df)
+                db_small = db_df[DB_SMALL_COLS].copy()
 
+                prog.progress(92)
+                status.info("Saving prepared data...")
+                st.session_state.input_long = input_long
+                st.session_state.db_small = db_small
                 st.session_state.universe = universe
                 st.session_state.all_classifications = sorted(
                     list(universe["classification_to_carriers"].keys()),
@@ -498,6 +544,14 @@ This tool helps you:
                 st.session_state.missing_plan_ids_count = len(missing_plan_ids)
                 st.session_state.deprecated_found = deprecated_found
                 st.session_state.deprecated_total = deprecated_total
+                st.session_state.debug_stats = {
+                    "input_rows": len(input_df),
+                    "input_long_rows": len(input_long),
+                    "db_rows_after_explode": len(db_df),
+                    "db_small_rows": len(db_small),
+                    "unique_input_plan_ids": len(extract_input_plan_ids(input_df)),
+                    "missing_plan_ids": len(missing_plan_ids),
+                }
 
                 # Reset selections
                 st.session_state.selected_pairs = set()
@@ -511,11 +565,16 @@ This tool helps you:
                 st.session_state.prev_class_filter = None
 
                 st.session_state.loaded = True
-                prog.progress(100, text="Done.")
-                st.success("Files loaded successfully.")
+                prog.progress(100)
+                status.success("Files loaded successfully.")
+
+                del input_df
+                del db_df
+                gc.collect()
+
             except Exception as e:
-                prog.progress(100, text="Failed.")
-                st.error(str(e))
+                prog.progress(100)
+                status.error(f"Load failed: {e}")
                 st.code(traceback.format_exc())
 
     # =========================================================
@@ -527,6 +586,11 @@ This tool helps you:
         classification_to_types = universe["classification_to_types"]
         class_carrier_to_types = universe["class_carrier_to_types"]
         carrier_to_plan_names = universe["carrier_to_plan_names"]
+
+        with st.expander("Diagnostics", expanded=False):
+            stats = st.session_state.get("debug_stats", {})
+            if stats:
+                st.write(stats)
 
         # Sidebar
         with st.sidebar:
@@ -798,17 +862,12 @@ This tool helps you:
                                 "Only selected plan types",
                             ],
                             key=mode_key,
-                            help=(
-                                "Use default / all: this carrier will follow the default selection. "
-                                "Only selected plan types: this carrier will use only the types you pick below."
-                            ),
                         )
 
                         st.multiselect(
                             f"Plan types for {carrier}",
                             options=carrier_types,
                             key=values_key,
-                            help="Pick the plan types to use for this carrier if you want a carrier-specific override.",
                         )
 
                         def save_type_override(c=carrier, cl=cls, mk=mode_key, vk=values_key):
@@ -835,9 +894,7 @@ This tool helps you:
             # -------------------------------------------------
             st.divider()
             st.markdown("### Step 5: Optional plan name filtering")
-            st.caption(
-                "Use this section only if you want to narrow the removal list further by plan name."
-            )
+            st.caption("Use this section only if you want to narrow the removal list further by plan name.")
 
             explorer_kw = st.text_input(
                 "Search plan names by keyword",
@@ -845,7 +902,6 @@ This tool helps you:
                 placeholder="Example: rocky or denver",
                 disabled=disabled_pick,
                 key="explorer_kw",
-                help="Enter a keyword to find matching plan names under the selected classification.",
             )
 
             explorer_mode = st.radio(
@@ -857,10 +913,6 @@ This tool helps you:
                 index=0,
                 disabled=disabled_pick,
                 key="explorer_mode",
-                help=(
-                    "Keep only these plan names = remove everything else for those carriers.\n"
-                    "Remove only these plan names = only those plan names will be removed."
-                ),
             )
 
             by_carrier = {}
@@ -872,11 +924,11 @@ This tool helps you:
                 dbs["Plan_Name"] = dbs["Plan_Name"].astype(str).map(normalize_str)
 
                 if all_classifications_mode:
-                    sub = dbs.copy()
+                    sub = dbs
                 else:
-                    sub = dbs[dbs["Plan Classification"] == active_cls].copy()
+                    sub = dbs[dbs["Plan Classification"] == active_cls]
 
-                sub = sub[sub["Plan_Name"].str.contains(re.escape(kw), case=False, na=False)].copy()
+                sub = sub[sub["Plan_Name"].str.contains(re.escape(kw), case=False, na=False)]
 
                 if not sub.empty:
                     sub = sub[["Carrier_Name", "Plan_Name"]].drop_duplicates()
@@ -952,10 +1004,7 @@ This tool helps you:
                     msk = ms_key_for(active_cls, car)
                     if msk not in st.session_state:
                         current = set(st.session_state.explorer_selected_names.get(bucket, set()) or set())
-                        st.session_state[msk] = sorted(
-                            list(current.intersection(set(plans))),
-                            key=lambda x: (x or "").lower()
-                        )
+                        st.session_state[msk] = sorted(list(current.intersection(set(plans))), key=lambda x: (x or "").lower())
 
                     pk = proc_key_for(active_cls, car)
                     if pk not in st.session_state:
@@ -971,11 +1020,7 @@ This tool helps you:
                     exp_label = f"{car} — selected {selected_count} of {len(plans)}"
 
                     with st.expander(exp_label, expanded=False):
-                        st.checkbox(
-                            "Apply this plan-name rule to this carrier",
-                            key=pk,
-                            help="If checked, this carrier will be included in the final rule when you confirm below.",
-                        )
+                        st.checkbox("Apply this plan-name rule to this carrier", key=pk)
 
                         def _sel_all_carrier(carrier=car):
                             cls = st.session_state.active_global_class_filter
@@ -1103,17 +1148,12 @@ This tool helps you:
                 rows = []
                 for (carrier, cls) in selected_pairs_sorted:
                     types_val = st.session_state.pair_types_map.get((carrier, cls), set())
-
                     rule = st.session_state.active_plan_rules.get((cls, carrier))
                     if rule is None:
                         rule_mode = "No plan-name rule"
                         rule_count = 0
                     else:
-                        rule_mode = (
-                            "Keep only selected names"
-                            if rule.get("mode") == "ALL_EXCEPT"
-                            else "Remove only selected names"
-                        )
+                        rule_mode = "Keep only selected names" if rule.get("mode") == "ALL_EXCEPT" else "Remove only selected names"
                         rule_count = len(rule.get("names", set()) or set())
 
                     rows.append(
@@ -1126,29 +1166,34 @@ This tool helps you:
                         }
                     )
 
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
                 st.divider()
                 st.markdown("### Step 7: Preview and download")
 
                 if st.button("Preview removal counts", use_container_width=True):
-                    with st.spinner("Building preview..."):
-                        tabs_preview = compute_removals_fast(
-                            input_long=st.session_state.input_long,
-                            db_small=st.session_state.db_small,
-                            selected_pairs=set(st.session_state.selected_pairs),
-                            pair_types_map=dict(st.session_state.pair_types_map),
-                            active_plan_rules=dict(st.session_state.active_plan_rules),
+                    try:
+                        with st.spinner("Building preview..."):
+                            tabs_preview = compute_removals_fast(
+                                input_long=st.session_state.input_long,
+                                db_small=st.session_state.db_small,
+                                selected_pairs=set(st.session_state.selected_pairs),
+                                pair_types_map=dict(st.session_state.pair_types_map),
+                                active_plan_rules=dict(st.session_state.active_plan_rules),
+                            )
+
+                        preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in tabs_preview.items()]
+                        preview_df = (
+                            pd.DataFrame(preview_rows).sort_values("MappingLevel")
+                            if preview_rows
+                            else pd.DataFrame(columns=["MappingLevel", "Rows"])
                         )
-                    preview_rows = [{"MappingLevel": k, "Rows": len(v)} for k, v in tabs_preview.items()]
-                    preview_df = (
-                        pd.DataFrame(preview_rows).sort_values("MappingLevel")
-                        if preview_rows
-                        else pd.DataFrame(columns=["MappingLevel", "Rows"])
-                    )
-                    total_preview = int(preview_df["Rows"].sum()) if not preview_df.empty else 0
-                    st.success(f"Preview ready. Total rows: {total_preview}")
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                        total_preview = int(preview_df["Rows"].sum()) if not preview_df.empty else 0
+                        st.success(f"Preview ready. Total rows: {total_preview}")
+                        st.dataframe(preview_df, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Preview failed: {e}")
+                        st.code(traceback.format_exc())
 
                 st.divider()
 
@@ -1160,41 +1205,44 @@ This tool helps you:
                     ],
                     index=0,
                     key="output_format_choice",
-                    help="Choose whether you want one row per PlanId or a grouped version.",
                 )
 
                 generate = st.button("Generate final removal output", type="primary", use_container_width=True)
                 if generate:
-                    with st.spinner("Computing removals..."):
-                        tabs_final = compute_removals_fast(
-                            input_long=st.session_state.input_long,
-                            db_small=st.session_state.db_small,
-                            selected_pairs=set(st.session_state.selected_pairs),
-                            pair_types_map=dict(st.session_state.pair_types_map),
-                            active_plan_rules=dict(st.session_state.active_plan_rules),
-                        )
+                    try:
+                        with st.spinner("Computing removals..."):
+                            tabs_final = compute_removals_fast(
+                                input_long=st.session_state.input_long,
+                                db_small=st.session_state.db_small,
+                                selected_pairs=set(st.session_state.selected_pairs),
+                                pair_types_map=dict(st.session_state.pair_types_map),
+                                active_plan_rules=dict(st.session_state.active_plan_rules),
+                            )
 
-                    total_rows = sum(len(df) for df in tabs_final.values())
-                    if total_rows == 0:
-                        st.warning("No removals matched your current selection.")
-                    else:
-                        if output_format.startswith("Grouped"):
-                            tabs_to_write = group_plans_comma(tabs_final)
-                            file_name = "removal_output_grouped.xlsx"
+                        total_rows = sum(len(df) for df in tabs_final.values())
+                        if total_rows == 0:
+                            st.warning("No removals matched your current selection.")
                         else:
-                            tabs_to_write = tabs_final
-                            file_name = "removal_output.xlsx"
+                            if output_format.startswith("Grouped"):
+                                tabs_to_write = group_plans_comma(tabs_final)
+                                file_name = "removal_output_grouped.xlsx"
+                            else:
+                                tabs_to_write = tabs_final
+                                file_name = "removal_output.xlsx"
 
-                        xbytes = make_excel_bytes(tabs_to_write)
+                            xbytes = make_excel_bytes(tabs_to_write)
 
-                        st.success(f"Removal output is ready. Tabs created: {len(tabs_to_write)}")
-                        st.download_button(
-                            f"Download {file_name}",
-                            data=xbytes,
-                            file_name=file_name,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
+                            st.success(f"Removal output is ready. Tabs created: {len(tabs_to_write)}")
+                            st.download_button(
+                                f"Download {file_name}",
+                                data=xbytes,
+                                file_name=file_name,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                            )
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
+                        st.code(traceback.format_exc())
 
 
 try:
