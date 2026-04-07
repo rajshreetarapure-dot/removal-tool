@@ -71,9 +71,8 @@ def get_pair_type_summary(val):
 
 
 # =========================================================
-# Cached file readers / preprocessors
+# File readers / preprocessors
 # =========================================================
-@st.cache_data(show_spinner=False)
 def read_uploaded_table(file_bytes, file_name):
     name = file_name.lower()
     bio = io.BytesIO(file_bytes)
@@ -84,7 +83,6 @@ def read_uploaded_table(file_bytes, file_name):
     raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
 
 
-@st.cache_data(show_spinner=False)
 def preprocess_input_df(file_bytes, file_name):
     input_df = read_uploaded_table(file_bytes, file_name)
     validate_columns(input_df, INPUT_REQUIRED_COLS, "Input CSV")
@@ -95,7 +93,6 @@ def preprocess_input_df(file_bytes, file_name):
     return input_df
 
 
-@st.cache_data(show_spinner=False)
 def preprocess_db_df(file_bytes, file_name):
     db_df = read_uploaded_table(file_bytes, file_name)
     validate_columns(db_df, DB_REQUIRED_COLS, "DB file")
@@ -113,7 +110,6 @@ def preprocess_db_df(file_bytes, file_name):
     return db_df
 
 
-@st.cache_data(show_spinner=False)
 def preprocess_deprecated_ids(file_bytes, file_name):
     dep_df = read_uploaded_table(file_bytes, file_name)
 
@@ -135,7 +131,6 @@ def preprocess_deprecated_ids(file_bytes, file_name):
     return dep_ids
 
 
-@st.cache_data(show_spinner=False)
 def build_plan_lookup(db_df):
     lookup = {}
     for _, row in db_df.iterrows():
@@ -145,7 +140,6 @@ def build_plan_lookup(db_df):
     return lookup
 
 
-@st.cache_data(show_spinner=False)
 def build_input_long(input_df):
     base = input_df[["MappingLevel", "ProviderId", "LocationId", "PlanIds"]].copy()
     base["PlanId"] = base["PlanIds"].astype(str).apply(split_csv_ids)
@@ -155,7 +149,6 @@ def build_input_long(input_df):
     return base
 
 
-@st.cache_data(show_spinner=False)
 def extract_input_plan_ids(input_df):
     plan_ids = set()
     for v in input_df["PlanIds"].astype(str).tolist():
@@ -164,7 +157,6 @@ def extract_input_plan_ids(input_df):
     return plan_ids
 
 
-@st.cache_data(show_spinner=False)
 def analyze_universe_from_frames(input_df, db_df):
     plan_lookup = build_plan_lookup(db_df)
 
@@ -245,15 +237,15 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
     for carrier, cls in selected_pairs:
         selected_pairs_by_cls.setdefault(cls, set()).add(carrier)
 
-    selected_plan_ids = set(input_long["PlanId"].astype(str).tolist())
-    db_small = db_small[db_small["Plan_ID"].isin(selected_plan_ids)].copy()
-    if db_small.empty:
+    selected_plan_ids = input_long["PlanId"].dropna().astype(str).unique()
+    db_small_filtered = db_small[db_small["Plan_ID"].isin(selected_plan_ids)].copy()
+    if db_small_filtered.empty:
         return {}
 
     for cls, carriers in selected_pairs_by_cls.items():
-        db_cls = db_small[
-            (db_small["Plan Classification"].astype(str).map(normalize_str) == normalize_str(cls)) &
-            (db_small["Carrier_Name"].astype(str).map(normalize_str).isin(carriers))
+        db_cls = db_small_filtered[
+            (db_small_filtered["Plan Classification"].astype(str).map(normalize_str) == normalize_str(cls)) &
+            (db_small_filtered["Carrier_Name"].astype(str).map(normalize_str).isin(carriers))
         ].copy()
 
         if db_cls.empty:
@@ -277,7 +269,8 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
 
         if restricted_for_cls:
             keep_parts = []
-            unrestricted_carriers = carriers - set([c for (c, _) in restricted_for_cls.keys()])
+            restricted_carriers = set([c for (c, _) in restricted_for_cls.keys()])
+            unrestricted_carriers = carriers - restricted_carriers
 
             if unrestricted_carriers:
                 keep_parts.append(db_cls[db_cls["Carrier_Name"].isin(unrestricted_carriers)].copy())
@@ -348,6 +341,10 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
         if not out_df.empty:
             tabs_accum.append(out_df)
 
+        del df_cls
+        del db_cls
+        gc.collect()
+
     if not tabs_accum:
         return {}
 
@@ -358,6 +355,9 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
     tabs = {}
     for lvl, g in final_df.groupby("MappingLevel", sort=False):
         tabs[str(lvl)] = g[["ProviderId", "LocationId", "PlanId"]].reset_index(drop=True)
+
+    del final_df
+    gc.collect()
 
     return tabs
 
@@ -480,9 +480,9 @@ This tool helps you:
     load_btn = st.button("Load and analyze files", type="primary")
 
     if input_file is not None:
-        st.write("Input file size (MB):", round(len(input_file.getvalue()) / (1024 * 1024), 2))
+        st.write("Input file size (MB):", round(input_file.size / (1024 * 1024), 2))
     if db_file is not None:
-        st.write("DB file size (MB):", round(len(db_file.getvalue()) / (1024 * 1024), 2))
+        st.write("DB file size (MB):", round(db_file.size / (1024 * 1024), 2))
 
     # =========================================================
     # Load
@@ -520,6 +520,8 @@ This tool helps you:
                     dep_ids = preprocess_deprecated_ids(dep_bytes, dep_file.name)
                     deprecated_total = len(dep_ids)
                     deprecated_found = len(missing_plan_ids.intersection(dep_ids))
+                    del dep_ids
+                    gc.collect()
 
                 prog.progress(82)
                 status.info("Preparing long input and DB slices...")
@@ -590,7 +592,6 @@ This tool helps you:
             if stats:
                 st.write(stats)
 
-        # Sidebar
         with st.sidebar:
             st.header("Current working view")
 
@@ -667,9 +668,6 @@ This tool helps you:
 
         left, right = st.columns([2.2, 1.2], gap="large")
 
-        # =====================================================
-        # LEFT
-        # =====================================================
         with left:
             st.markdown("### Step 2: Choose a plan classification")
             if disabled_pick:
@@ -682,9 +680,6 @@ This tool helps you:
                     st.success(f"Working on classification: **{active_cls}**")
                     st.caption(f"Carriers visible in this classification: {len(displayed_carriers)}")
 
-            # -------------------------------------------------
-            # Step 3: Carrier selection
-            # -------------------------------------------------
             st.markdown("### Step 3: Select carriers")
 
             def add_all_shown():
@@ -765,9 +760,6 @@ This tool helps you:
                 on_click=add_selected_carriers,
             )
 
-            # -------------------------------------------------
-            # Step 4: Plan type selection
-            # -------------------------------------------------
             st.divider()
             st.markdown("### Step 4: Choose plan types")
             st.caption(
@@ -887,9 +879,6 @@ This tool helps you:
                             use_container_width=True,
                         )
 
-            # -------------------------------------------------
-            # Step 5: Plan name explorer
-            # -------------------------------------------------
             st.divider()
             st.markdown("### Step 5: Optional plan name filtering")
             st.caption("Use this section only if you want to narrow the removal list further by plan name.")
@@ -1129,9 +1118,6 @@ This tool helps you:
                 with ap2:
                     st.button("Clear active rules for this classification", use_container_width=True, on_click=clear_rules_for_this_class)
 
-        # =====================================================
-        # RIGHT: Summary + Output
-        # =====================================================
         with right:
             st.markdown("### Step 6: Review your selection")
 
@@ -1189,6 +1175,11 @@ This tool helps you:
                         total_preview = int(preview_df["Rows"].sum()) if not preview_df.empty else 0
                         st.success(f"Preview ready. Total rows: {total_preview}")
                         st.dataframe(preview_df, use_container_width=True)
+
+                        del tabs_preview
+                        del preview_df
+                        gc.collect()
+
                     except Exception as e:
                         st.error(f"Preview failed: {e}")
                         st.code(traceback.format_exc())
@@ -1238,6 +1229,10 @@ This tool helps you:
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                 use_container_width=True,
                             )
+
+                        del tabs_final
+                        gc.collect()
+
                     except Exception as e:
                         st.error(f"Generation failed: {e}")
                         st.code(traceback.format_exc())
