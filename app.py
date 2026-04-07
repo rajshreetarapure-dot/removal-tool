@@ -239,132 +239,125 @@ def compute_removals_fast(input_long, db_small, selected_pairs, pair_types_map, 
     if input_long is None or input_long.empty or db_small is None or db_small.empty:
         return {}
 
-    allow_df = pd.DataFrame(list(selected_pairs), columns=["Carrier_Name", "Plan Classification"])
-    if allow_df.empty:
-        return {}
+    tabs_accum = []
+
+    selected_pairs_by_cls = {}
+    for carrier, cls in selected_pairs:
+        selected_pairs_by_cls.setdefault(cls, set()).add(carrier)
 
     selected_plan_ids = set(input_long["PlanId"].astype(str).tolist())
-    db_filtered = db_small[db_small["Plan_ID"].isin(selected_plan_ids)].copy()
-    if db_filtered.empty:
+    db_small = db_small[db_small["Plan_ID"].isin(selected_plan_ids)].copy()
+    if db_small.empty:
         return {}
 
-    df = input_long.merge(
-        db_filtered,
-        left_on="PlanId",
-        right_on="Plan_ID",
-        how="inner",
-        copy=False,
-    )
-    if df.empty:
-        return {}
+    for cls, carriers in selected_pairs_by_cls.items():
+        db_cls = db_small[
+            (db_small["Plan Classification"].astype(str).map(normalize_str) == normalize_str(cls)) &
+            (db_small["Carrier_Name"].astype(str).map(normalize_str).isin(carriers))
+        ].copy()
 
-    df["Carrier_Name"] = df["Carrier_Name"].astype(str).map(normalize_str)
-    df["Plan_Type"] = df["Plan_Type"].astype(str).map(normalize_str)
-    df["Plan Classification"] = df["Plan Classification"].astype(str).map(normalize_str)
-    df["Plan_Name"] = df["Plan_Name"].astype(str).map(normalize_str)
+        if db_cls.empty:
+            continue
 
-    df.loc[df["Plan_Type"] == "", "Plan_Type"] = "(blank)"
-    df.loc[df["Plan Classification"] == "", "Plan Classification"] = "(blank)"
-    df.loc[df["Plan_Name"] == "", "Plan_Name"] = "(blank)"
+        restricted_for_cls = {}
+        no_match_pairs = set()
 
-    df = df.merge(allow_df, on=["Carrier_Name", "Plan Classification"], how="inner", copy=False)
-    if df.empty:
-        return {}
+        for carrier in carriers:
+            val = pair_types_map.get((carrier, cls), set())
+            if val is None:
+                no_match_pairs.add((carrier, cls))
+            elif isinstance(val, set) and len(val) > 0:
+                restricted_for_cls[(carrier, cls)] = val
 
-    # Apply plan-name rules
-    if active_plan_rules:
-        rule_key = []
-        for cls, car in zip(df["Plan Classification"], df["Carrier_Name"]):
-            if (cls, car) in active_plan_rules:
-                rule_key.append((cls, car))
-            elif (cls, "*") in active_plan_rules:
-                rule_key.append((cls, "*"))
+        if no_match_pairs:
+            no_match_carriers = set([c for c, _ in no_match_pairs])
+            db_cls = db_cls[~db_cls["Carrier_Name"].isin(no_match_carriers)].copy()
+            if db_cls.empty:
+                continue
+
+        if restricted_for_cls:
+            keep_parts = []
+            unrestricted_carriers = carriers - set([c for (c, _) in restricted_for_cls.keys()])
+
+            if unrestricted_carriers:
+                keep_parts.append(db_cls[db_cls["Carrier_Name"].isin(unrestricted_carriers)].copy())
+
+            for (carrier, _cls), allowed_types in restricted_for_cls.items():
+                sub = db_cls[
+                    (db_cls["Carrier_Name"] == carrier) &
+                    (db_cls["Plan_Type"].astype(str).map(normalize_str).isin(allowed_types))
+                ].copy()
+                if not sub.empty:
+                    keep_parts.append(sub)
+
+            if keep_parts:
+                db_cls = pd.concat(keep_parts, ignore_index=True)
             else:
-                rule_key.append(None)
+                db_cls = db_cls.iloc[0:0].copy()
 
-        df["_rk"] = rule_key
-        keep_mask = pd.Series(True, index=df.index)
-
-        valid_rule_keys = [k for k in df["_rk"].unique().tolist() if k is not None]
-        for rk in valid_rule_keys:
-            rule = active_plan_rules.get(rk)
-            if not rule:
+            if db_cls.empty:
                 continue
 
-            mode = rule.get("mode", "ALL")
-            if mode == "ALL":
+        if active_plan_rules:
+            keep_mask = pd.Series(True, index=db_cls.index)
+
+            for carrier in carriers:
+                rule = active_plan_rules.get((cls, carrier))
+                if not rule:
+                    continue
+
+                mode = rule.get("mode", "ALL")
+                if mode == "ALL":
+                    continue
+
+                names = set(rule.get("names", set()) or set())
+                kws = list(rule.get("keywords", []) or [])
+
+                sub_idx = db_cls.index[db_cls["Carrier_Name"] == carrier]
+                if len(sub_idx) == 0:
+                    continue
+
+                sub = db_cls.loc[sub_idx]
+                plan_names = sub["Plan_Name"].astype(str).map(normalize_str)
+                m = _rule_match_series(plan_names, names, kws)
+
+                if mode == "ONLY":
+                    keep_mask.loc[sub_idx] = m.values
+                elif mode == "ALL_EXCEPT":
+                    keep_mask.loc[sub_idx] = (~m).values
+
+            db_cls = db_cls[keep_mask].copy()
+            if db_cls.empty:
                 continue
 
-            names = set(rule.get("names", set()) or set())
-            kws = list(rule.get("keywords", []) or [])
-
-            sub_idx = df.index[df["_rk"] == rk]
-            if len(sub_idx) == 0:
-                continue
-
-            sub = df.loc[sub_idx]
-            m = _rule_match_series(sub["Plan_Name"], names, kws)
-
-            if mode == "ONLY":
-                keep_mask.loc[sub_idx] = m.values
-            elif mode == "ALL_EXCEPT":
-                keep_mask.loc[sub_idx] = (~m).values
-
-        df = df[keep_mask].drop(columns=["_rk"]).copy()
-        if df.empty:
-            return {}
-
-    # Remove NO MATCH pairs
-    no_match_pairs = set([k for k, v in pair_types_map.items() if v is None])
-    if no_match_pairs:
-        tmp = pd.DataFrame(list(no_match_pairs), columns=["Carrier_Name", "Plan Classification"])
-        df = df.merge(tmp.assign(__drop=1), on=["Carrier_Name", "Plan Classification"], how="left")
-        df = df[df["__drop"].isna()].drop(columns=["__drop"])
-        if df.empty:
-            return {}
-
-    # Plan type restrictions per pair
-    restricted_types = dict([(k, v) for k, v in pair_types_map.items() if isinstance(v, set) and len(v) > 0])
-    if restricted_types:
-        allow_rows = []
-        for (carrier, cls), typeset in restricted_types.items():
-            for t in typeset:
-                allow_rows.append((carrier, cls, t))
-
-        allow_types_df = pd.DataFrame(
-            allow_rows,
-            columns=["Carrier_Name", "Plan Classification", "Plan_Type"]
+        df_cls = input_long.merge(
+            db_cls,
+            left_on="PlanId",
+            right_on="Plan_ID",
+            how="inner",
+            copy=False,
         )
 
-        restricted_pairs_df = pd.DataFrame(
-            list(restricted_types.keys()),
-            columns=["Carrier_Name", "Plan Classification"]
+        if df_cls.empty:
+            continue
+
+        out_df = df_cls[["MappingLevel", "ProviderId", "LocationId", "PlanId"]].drop_duplicates(
+            subset=["MappingLevel", "ProviderId", "LocationId", "PlanId"]
         )
 
-        df_restr = df.merge(restricted_pairs_df, on=["Carrier_Name", "Plan Classification"], how="inner")
-        df_all = df.merge(restricted_pairs_df.assign(__r=1), on=["Carrier_Name", "Plan Classification"], how="left")
-        df_all = df_all[df_all["__r"].isna()].drop(columns=["__r"])
+        if not out_df.empty:
+            tabs_accum.append(out_df)
 
-        df_restr = df_restr.merge(
-            allow_types_df,
-            on=["Carrier_Name", "Plan Classification", "Plan_Type"],
-            how="inner"
-        )
+    if not tabs_accum:
+        return {}
 
-        df = pd.concat([df_all, df_restr], ignore_index=True)
-        if df.empty:
-            return {}
-
-    out_df = df[["MappingLevel", "ProviderId", "LocationId", "PlanId"]].drop_duplicates(
+    final_df = pd.concat(tabs_accum, ignore_index=True).drop_duplicates(
         subset=["MappingLevel", "ProviderId", "LocationId", "PlanId"]
     )
 
     tabs = {}
-    for lvl, g in out_df.groupby("MappingLevel", sort=False):
+    for lvl, g in final_df.groupby("MappingLevel", sort=False):
         tabs[str(lvl)] = g[["ProviderId", "LocationId", "PlanId"]].reset_index(drop=True)
-
-    del df
-    gc.collect()
 
     return tabs
 
@@ -485,6 +478,11 @@ This tool helps you:
         )
 
     load_btn = st.button("Load and analyze files", type="primary")
+
+    if input_file is not None:
+        st.write("Input file size (MB):", round(len(input_file.getvalue()) / (1024 * 1024), 2))
+    if db_file is not None:
+        st.write("DB file size (MB):", round(len(db_file.getvalue()) / (1024 * 1024), 2))
 
     # =========================================================
     # Load
