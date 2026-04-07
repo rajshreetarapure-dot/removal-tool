@@ -351,7 +351,7 @@ def apply_default_types_to_selected_pairs(active_cls: str, default_types: list[s
     new_map = dict(st.session_state.pair_types_map)
 
     for carrier, cls in st.session_state.selected_pairs:
-        if cls != active_cls:
+        if active_cls != "(all classifications)" and cls != active_cls:
             continue
         if default_types_set:
             new_map[(carrier, cls)] = set(default_types_set)
@@ -541,11 +541,15 @@ if st.session_state.loaded:
 
         class_filter = st.selectbox(
             "Plan Classification",
-            options=["(select)"] + st.session_state.all_classifications,
+            options=["(select)", "(all classifications)"] + st.session_state.all_classifications,
             index=0,
-            format_func=lambda x: "Select a classification" if x == "(select)" else x,
+            format_func=lambda x: (
+                "Select a classification" if x == "(select)"
+                else "All classifications" if x == "(all classifications)"
+                else x
+            ),
             key="sidebar_class_filter",
-            help="Choose the classification you want to work on.",
+            help="Choose the classification you want to work on, or select All classifications.",
         )
 
         st.divider()
@@ -567,6 +571,7 @@ if st.session_state.loaded:
             st.info(f"Missing in DB: {miss} (upload deprecated file to compare)")
 
     active_cls = None if class_filter == "(select)" else class_filter
+    all_classifications_mode = active_cls == "(all classifications)"
     st.session_state.active_global_class_filter = active_cls
     disabled_pick = active_cls is None
 
@@ -576,10 +581,15 @@ if st.session_state.loaded:
         st.session_state.bulk_default_types = []
         st.session_state.prev_class_filter = class_filter
 
-    carriers_base = (
-        sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower())
-        if active_cls else []
-    )
+    if not active_cls:
+        carriers_base = []
+    elif all_classifications_mode:
+        all_carriers = set()
+        for carriers in classification_to_carriers.values():
+            all_carriers.update(carriers)
+        carriers_base = sorted(list(all_carriers), key=lambda x: x.lower())
+    else:
+        carriers_base = sorted(list(classification_to_carriers.get(active_cls, set())), key=lambda x: x.lower())
 
     if active_cls and view_search.strip():
         q = view_search.strip().lower()
@@ -607,10 +617,12 @@ if st.session_state.loaded:
         if disabled_pick:
             st.info("Start by selecting a Plan Classification from the left sidebar.")
         else:
-            st.success(f"Working on classification: **{active_cls}**")
-            st.caption(
-                f"Carriers visible in this classification: {len(displayed_carriers)}"
-            )
+            if all_classifications_mode:
+                st.success("Working on classification: **All classifications**")
+                st.caption(f"Carriers visible across all classifications: {len(displayed_carriers)}")
+            else:
+                st.success(f"Working on classification: **{active_cls}**")
+                st.caption(f"Carriers visible in this classification: {len(displayed_carriers)}")
 
         # -------------------------------------------------
         # Step 3: Carrier selection
@@ -621,20 +633,37 @@ if st.session_state.loaded:
             cls = st.session_state.active_global_class_filter
             if not cls:
                 return
+
             for carrier in st.session_state.get("displayed_carriers_cache", []):
-                pair = (carrier, cls)
-                st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())
+                if cls == "(all classifications)":
+                    for actual_cls in st.session_state.all_classifications:
+                        if carrier in classification_to_carriers.get(actual_cls, set()):
+                            pair = (carrier, actual_cls)
+                            st.session_state.selected_pairs.add(pair)
+                            st.session_state.pair_types_map.setdefault(pair, set())
+                else:
+                    pair = (carrier, cls)
+                    st.session_state.selected_pairs.add(pair)
+                    st.session_state.pair_types_map.setdefault(pair, set())
 
         def add_selected_carriers():
             cls = st.session_state.active_global_class_filter
             if not cls:
                 return
+
             picked = st.session_state.get("carrier_add_picker", [])
             for carrier in picked:
-                pair = (carrier, cls)
-                st.session_state.selected_pairs.add(pair)
-                st.session_state.pair_types_map.setdefault(pair, set())
+                if cls == "(all classifications)":
+                    for actual_cls in st.session_state.all_classifications:
+                        if carrier in classification_to_carriers.get(actual_cls, set()):
+                            pair = (carrier, actual_cls)
+                            st.session_state.selected_pairs.add(pair)
+                            st.session_state.pair_types_map.setdefault(pair, set())
+                else:
+                    pair = (carrier, cls)
+                    st.session_state.selected_pairs.add(pair)
+                    st.session_state.pair_types_map.setdefault(pair, set())
+
             st.session_state["carrier_add_picker"] = []
 
         def clear_all_selections():
@@ -655,7 +684,11 @@ if st.session_state.loaded:
             st.button("Clear everything", on_click=clear_all_selections)
         with colC:
             selected_total = len(st.session_state.selected_pairs)
-            selected_in_cls = len([1 for (_, cls) in st.session_state.selected_pairs if cls == active_cls]) if active_cls else 0
+            selected_in_cls = (
+                len(st.session_state.selected_pairs)
+                if all_classifications_mode
+                else len([1 for (_, cls) in st.session_state.selected_pairs if cls == active_cls]) if active_cls else 0
+            )
             st.caption(
                 f"Visible: {len(displayed_carriers)} | Selected in this classification: {selected_in_cls} | Total selected: {selected_total}"
             )
@@ -685,14 +718,26 @@ if st.session_state.loaded:
         )
 
         selected_pairs_in_active_cls = sorted(
-            [(carrier, cls) for (carrier, cls) in st.session_state.selected_pairs if cls == active_cls],
-            key=lambda x: x[0].lower()
+            [
+                (carrier, cls)
+                for (carrier, cls) in st.session_state.selected_pairs
+                if all_classifications_mode or cls == active_cls
+            ],
+            key=lambda x: (x[0].lower(), x[1].lower())
         )
 
-        available_types_for_class = sorted(
-            list(classification_to_types.get(active_cls, set())),
-            key=lambda x: x.lower()
-        ) if active_cls else []
+        if not active_cls:
+            available_types_for_class = []
+        elif all_classifications_mode:
+            all_types_for_view = set()
+            for types_set in classification_to_types.values():
+                all_types_for_view.update(types_set)
+            available_types_for_class = sorted(list(all_types_for_view), key=lambda x: x.lower())
+        else:
+            available_types_for_class = sorted(
+                list(classification_to_types.get(active_cls, set())),
+                key=lambda x: x.lower()
+            )
 
         if disabled_pick:
             st.info("Select a classification first.")
@@ -749,7 +794,7 @@ if st.session_state.loaded:
                     else:
                         st.session_state[values_key] = []
 
-                with st.expander(f"{carrier}", expanded=False):
+                with st.expander(f"{carrier} ({cls})", expanded=False):
                     st.radio(
                         "How should this carrier use plan types?",
                         options=[
@@ -830,7 +875,11 @@ if st.session_state.loaded:
             dbs["Plan Classification"] = dbs["Plan Classification"].astype(str).map(normalize_str)
             dbs["Plan_Name"] = dbs["Plan_Name"].astype(str).map(normalize_str)
 
-            sub = dbs[dbs["Plan Classification"] == active_cls].copy()
+            if all_classifications_mode:
+                sub = dbs.copy()
+            else:
+                sub = dbs[dbs["Plan Classification"] == active_cls].copy()
+
             sub = sub[sub["Plan_Name"].str.contains(re.escape(kw), case=False, na=False)].copy()
 
             if not sub.empty:
@@ -911,7 +960,10 @@ if st.session_state.loaded:
 
                 pk = proc_key_for(active_cls, car)
                 if pk not in st.session_state:
-                    st.session_state[pk] = ((car, active_cls) in st.session_state.selected_pairs)
+                    st.session_state[pk] = any(
+                        (car, cls) in st.session_state.selected_pairs
+                        for cls in st.session_state.all_classifications
+                    ) if all_classifications_mode else ((car, active_cls) in st.session_state.selected_pairs)
 
                 selected_count = len(set(st.session_state[msk]))
                 exp_label = f"{car} — selected {selected_count} of {len(plans)}"
@@ -978,26 +1030,36 @@ if st.session_state.loaded:
                     if not names:
                         continue
 
-                    pair = (car, cls)
-                    if pair not in st.session_state.selected_pairs:
-                        st.session_state.selected_pairs.add(pair)
-                        if st.session_state.get("bulk_default_types", []):
-                            st.session_state.pair_types_map[pair] = set(st.session_state["bulk_default_types"])
-                        else:
-                            st.session_state.pair_types_map.setdefault(pair, set())
-                        added_to_summary += 1
+                    if all_classifications_mode:
+                        matching_classes = [
+                            actual_cls
+                            for actual_cls in st.session_state.all_classifications
+                            if car in classification_to_carriers.get(actual_cls, set())
+                        ]
+                    else:
+                        matching_classes = [cls]
 
-                    st.session_state.active_plan_rules[(cls, car)] = {
-                        "mode": rule_mode,
-                        "names": set(names),
-                        "keywords": [],
-                    }
-                    applied += 1
+                    for actual_cls in matching_classes:
+                        pair = (car, actual_cls)
+                        if pair not in st.session_state.selected_pairs:
+                            st.session_state.selected_pairs.add(pair)
+                            if st.session_state.get("bulk_default_types", []):
+                                st.session_state.pair_types_map[pair] = set(st.session_state["bulk_default_types"])
+                            else:
+                                st.session_state.pair_types_map.setdefault(pair, set())
+                            added_to_summary += 1
+
+                        st.session_state.active_plan_rules[(actual_cls, car)] = {
+                            "mode": rule_mode,
+                            "names": set(names),
+                            "keywords": [],
+                        }
+                        applied += 1
 
                 if applied == 0:
                     st.warning("Nothing was applied. Select at least one plan name and choose at least one carrier.")
                 else:
-                    msg = f"Applied plan-name rules to {applied} carriers for {cls}."
+                    msg = f"Applied plan-name rules to {applied} carrier/classification combinations."
                     if added_to_summary:
                         msg += f" Added {added_to_summary} carriers into your selection."
                     st.success(msg)
@@ -1006,10 +1068,15 @@ if st.session_state.loaded:
                 cls = st.session_state.active_global_class_filter
                 if not cls:
                     return
-                to_del = [k for k in list(st.session_state.active_plan_rules.keys()) if k[0] == cls]
-                for k in to_del:
-                    st.session_state.active_plan_rules.pop(k, None)
-                st.success(f"Cleared active plan-name rules for {cls}.")
+
+                if all_classifications_mode:
+                    st.session_state.active_plan_rules = {}
+                    st.success("Cleared active plan-name rules for all classifications.")
+                else:
+                    to_del = [k for k in list(st.session_state.active_plan_rules.keys()) if k[0] == cls]
+                    for k in to_del:
+                        st.session_state.active_plan_rules.pop(k, None)
+                    st.success(f"Cleared active plan-name rules for {cls}.")
 
             ap1, ap2 = st.columns(2)
             with ap1:
